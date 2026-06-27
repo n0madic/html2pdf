@@ -1,0 +1,75 @@
+# Fully static html2pdf binary for Linux x86_64, built on Alpine/musl.
+#
+# Unlike glibc/macOS, musl supports static linking of the whole C library, and
+# Alpine ships *-static packages for the Cairo/libcurl dependency closure, so
+# the result has no runtime shared-library dependencies at all.
+#
+# Pango ships no static archive in any distro, so for the Pango backend it is
+# built from source as a static library (Xft/X11 backend disabled — unused).
+#
+# Build (default Pango backend):
+#   docker build -f docker/Dockerfile.alpine-static -t html2pdf-static .
+# Toy backend (no Pango, smaller, fewer deps):
+#   docker build -f docker/Dockerfile.alpine-static --build-arg TEXT_BACKEND=toy \
+#                -t html2pdf-static .
+# Extract the binary:
+#   id=$(docker create html2pdf-static) && docker cp "$id:/html2pdf" ./html2pdf \
+#     && docker rm "$id"
+#
+# Note: building on Apple Silicon runs this x86_64 image under emulation, which
+# is slow and can crash the compiler on heavy files; the retry loops below make
+# the build resilient. On native x86_64 the loops simply succeed on the first try.
+
+FROM alpine:3.20 AS build
+
+ARG TEXT_BACKEND=pango
+ARG PANGO_VER=1.54.0
+
+# Toolchain + headers + static archives for the full dependency closure.
+RUN apk add --no-cache \
+        build-base cmake samurai git pkgconf meson ninja-build xz wget \
+        cairo-dev pixman-dev curl-dev \
+        pango-dev glib-dev harfbuzz-dev graphite2-dev fribidi-dev pcre2-dev \
+        fontconfig-dev freetype-dev expat-dev bzip2-dev \
+        brotli-dev zlib-dev zstd-dev nghttp2-dev openssl-dev c-ares-dev \
+        libidn2-dev libpsl-dev libunistring-dev libxml2-dev \
+        libx11-dev libxcb-dev libxext-dev libxrender-dev libxau-dev libxdmcp-dev \
+        util-linux-dev \
+        cairo-static pixman-static curl-static \
+        fontconfig-static freetype-static expat-static libpng-static \
+        harfbuzz-static graphite2-static glib-static fribidi-static \
+        zlib-static bzip2-static brotli-static zstd-static nghttp2-static \
+        openssl-libs-static c-ares-static libidn2-static libpsl-static \
+        libunistring-static libxml2-static \
+        libx11-static libxcb-static libxext-static \
+        util-linux-static \
+        font-dejavu
+
+# Build a static Pango (no distro ships pango-static) for the Pango backend.
+RUN if [ "$TEXT_BACKEND" = "pango" ]; then \
+        cd /tmp \
+        && wget -q "https://download.gnome.org/sources/pango/${PANGO_VER%.*}/pango-${PANGO_VER}.tar.xz" \
+        && tar xf "pango-${PANGO_VER}.tar.xz" && cd "pango-${PANGO_VER}" \
+        && meson setup build --prefix=/usr/local --default-library=static \
+            --buildtype=release -Dintrospection=disabled \
+            -Dbuild-testsuite=false -Dbuild-examples=false -Dxft=disabled \
+        && (for i in 1 2 3 4 5; do ninja -C build -j 2 && break; echo "ninja retry $i"; done) \
+        && ninja -C build install \
+        && cd /tmp && rm -rf "pango-${PANGO_VER}" "pango-${PANGO_VER}.tar.xz"; \
+    fi
+ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/lib/pkgconfig
+
+COPY . /src
+RUN cmake -S /src -B /build -DCMAKE_BUILD_TYPE=Release \
+        -DHTML2PDF_TEXT_BACKEND="$TEXT_BACKEND" -DHTML2PDF_DEP_LINKAGE=static \
+    && (for i in 1 2 3 4 5; do cmake --build /build -j 2 && break; echo "build retry $i"; done) \
+    && strip /build/html2pdf \
+    && /build/html2pdf --help | grep -i "text backend"
+
+# Minimal runtime image: just the static binary plus a default font so text
+# rendering works out of the box. (Install font-noto-cjk / font-noto-emoji for
+# CJK and emoji coverage.)
+FROM alpine:3.20
+RUN apk add --no-cache font-dejavu fontconfig
+COPY --from=build /build/html2pdf /usr/local/bin/html2pdf
+ENTRYPOINT ["/usr/local/bin/html2pdf"]

@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Per-resource base resolution</title>
+<!-- Stylesheet lives in assets/; its own relative references (bg.png and the
+     @import below) must resolve against assets/, not against this file's dir. -->
+<link rel="stylesheet" href="assets/sheet.css">
+</head>
+<body>
+  <h1>Per-resource base</h1>
+  <p class="box">background resolved relative to the stylesheet</p>
+</body>
+</html>

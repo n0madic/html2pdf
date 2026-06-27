@@ -1,0 +1,13 @@
+# Out-of-source build directories (host/macOS artifacts must not enter the image)
+build/
+build-*/
+cmake-build-*/
+
+# VCS / editor / OS noise
+.git/
+.idea/
+.vscode/
+.DS_Store
+
+# Test output
+tests/output/

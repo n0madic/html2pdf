@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Unicode / shaping / BiDi</title>
+<style>
+  body { font-family: sans-serif; margin: 24px; font-size: 20px; line-height: 1.6; }
+  h1 { font-size: 24px; }
+  .lbl { color: #888; font-size: 14px; }
+  .deco { text-decoration: underline wavy #c01c28; }
+</style>
+</head>
+<body>
+  <h1>Unicode rendering sample</h1>
+  <p><span class="lbl">Latin + diacritics:</span> Crème brûlée — naïve façade, Ångström.</p>
+  <p><span class="lbl">Cyrillic:</span> Съешь же ещё этих мягких французских булок.</p>
+  <p><span class="lbl">CJK (Chinese):</span> 你好，世界！快速棕色狐狸。</p>
+  <p><span class="lbl">CJK (Japanese):</span> いろはにほへと 日本語の組版。</p>
+  <p><span class="lbl">RTL (Arabic):</span> مرحبا بالعالم — اختبار النص العربي.</p>
+  <p><span class="lbl">RTL (Hebrew):</span> שלום עולם — בדיקת טקסט עברי.</p>
+  <p><span class="lbl">Mixed BiDi:</span> Hello שלום world مرحبا 123 end.</p>
+  <p><span class="lbl">Emoji:</span> ✅ ❤ ★ ☂ ♞ → ∞ © µ.</p>
+  <p><span class="deco">Wavy underline decoration (Pango styles).</span></p>
+</body>
+</html>

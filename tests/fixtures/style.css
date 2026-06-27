@@ -1,0 +1,23 @@
+body {
+  font-family: sans-serif;
+  margin: 24px;
+  color: #2e3436;
+  background: #ffffff;
+}
+
+h1 {
+  color: #c01c28;
+  font-size: 26px;
+}
+
+.card {
+  border: 2px solid #c01c28;
+  border-radius: 8px;
+  padding: 16px;
+  margin-top: 12px;
+  background: #fff5f5;
+}
+
+img {
+  border: 1px solid #888;
+}

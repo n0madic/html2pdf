@@ -1,0 +1,3 @@
+/* Both references are relative to THIS stylesheet (assets/), not to the HTML. */
+@import "nested.css";
+.box { background: url(bg.png); width: 120px; height: 120px; }

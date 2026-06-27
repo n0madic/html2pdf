@@ -1,0 +1,392 @@
+#include "resource_loader.h"
+
+#include <curl/curl.h>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+
+#include <cstdint>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <mutex>
+
+namespace html2pdf {
+
+namespace {
+
+namespace fs = std::filesystem;
+
+// Hard cap on a single HTTP response held in memory, to bound worst-case
+// memory use against a server that streams unbounded data.
+constexpr size_t kMaxResponseBytes = 64u * 1024u * 1024u;  // 64 MiB
+
+std::once_flag g_curl_once;
+
+void ensure_curl_global() {
+    std::call_once(g_curl_once, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
+}
+
+// True if the string starts with "scheme://".
+bool has_scheme(const std::string& s) {
+    auto pos = s.find("://");
+    if (pos == std::string::npos || pos == 0) return false;
+    for (size_t i = 0; i < pos; ++i) {
+        char c = s[i];
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+bool is_http_url(const std::string& s) {
+    return s.compare(0, 7, "http://") == 0 || s.compare(0, 8, "https://") == 0;
+}
+
+// Directory part of a filesystem path, including the trailing separator.
+// Returns "" when the path has no directory component.
+std::string dir_of(const std::string& path) {
+    auto pos = path.find_last_of('/');
+    if (pos == std::string::npos) return "";
+    return path.substr(0, pos + 1);
+}
+
+// True if `path` resolves to a location inside `dir` (lexical + symlink-aware
+// containment). Used to keep filesystem sub-resources within the document tree.
+bool path_within(const std::string& dir, const std::string& path) {
+    if (dir.empty()) return true;  // no root configured -> no containment
+    std::error_code ec;
+    fs::path base = fs::weakly_canonical(fs::absolute(dir, ec), ec);
+    if (ec) return false;
+    fs::path cand = fs::weakly_canonical(fs::absolute(path, ec), ec);
+    if (ec) return false;
+    fs::path rel = fs::relative(cand, base, ec);
+    if (ec || rel.empty()) return false;
+    auto it = rel.begin();
+    return it != rel.end() && *it != "..";
+}
+
+// --- SSRF address classification ------------------------------------------
+
+// IPv4 address (host byte order) that must not be reached from a URL fetch.
+bool ipv4_blocked(uint32_t a) {
+    auto in = [a](uint32_t net, int bits) {
+        const uint32_t mask = bits == 0 ? 0u : (0xFFFFFFFFu << (32 - bits));
+        return (a & mask) == (net & mask);
+    };
+    return in(0x00000000u, 8) ||   // 0.0.0.0/8       "this host"
+           in(0x0A000000u, 8) ||   // 10.0.0.0/8      private
+           in(0x64400000u, 10) ||  // 100.64.0.0/10   CGNAT
+           in(0x7F000000u, 8) ||   // 127.0.0.0/8     loopback
+           in(0xA9FE0000u, 16) ||  // 169.254.0.0/16  link-local (cloud metadata)
+           in(0xAC100000u, 12) ||  // 172.16.0.0/12   private
+           in(0xC0000000u, 24) ||  // 192.0.0.0/24    IETF protocol assignments
+           in(0xC0000200u, 24) ||  // 192.0.2.0/24    TEST-NET-1
+           in(0xC0A80000u, 16) ||  // 192.168.0.0/16  private
+           in(0xC6120000u, 15) ||  // 198.18.0.0/15   benchmarking
+           in(0xC6336400u, 24) ||  // 198.51.100.0/24 TEST-NET-2
+           in(0xCB007100u, 24) ||  // 203.0.113.0/24  TEST-NET-3
+           in(0xE0000000u, 4) ||   // 224.0.0.0/4     multicast
+           in(0xF0000000u, 4);     // 240.0.0.0/4     reserved / broadcast
+}
+
+// IPv6 address (16 bytes, network order) that must not be reached.
+bool ipv6_blocked(const uint8_t b[16]) {
+    bool all_zero = true;
+    for (int i = 0; i < 16; ++i) {
+        if (b[i] != 0) { all_zero = false; break; }
+    }
+    if (all_zero) return true;  // :: unspecified
+    bool loopback = b[15] == 1;
+    for (int i = 0; i < 15 && loopback; ++i) {
+        if (b[i] != 0) loopback = false;
+    }
+    if (loopback) return true;  // ::1
+    // IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d): classify the
+    // embedded IPv4 address.
+    bool prefix96_zero = true;
+    for (int i = 0; i < 10; ++i) {
+        if (b[i] != 0) { prefix96_zero = false; break; }
+    }
+    if (prefix96_zero && ((b[10] == 0xFF && b[11] == 0xFF) || (b[10] == 0 && b[11] == 0))) {
+        uint32_t v4 = (static_cast<uint32_t>(b[12]) << 24) |
+                      (static_cast<uint32_t>(b[13]) << 16) |
+                      (static_cast<uint32_t>(b[14]) << 8) | b[15];
+        return ipv4_blocked(v4);
+    }
+    if ((b[0] & 0xFE) == 0xFC) return true;                     // fc00::/7  ULA
+    if (b[0] == 0xFE && (b[1] & 0xC0) == 0x80) return true;     // fe80::/10 link-local
+    if (b[0] == 0xFF) return true;                              // ff00::/8  multicast
+    return false;
+}
+
+// True if the textual IP (as reported by libcurl for the connected peer) is a
+// non-public address that an SSRF fetch must not reach. Unknown/unparseable
+// addresses are blocked, failing safe.
+bool is_blocked_ip(const char* ip) {
+    if (!ip || !*ip) return true;
+    in_addr v4{};
+    if (inet_pton(AF_INET, ip, &v4) == 1) {
+        return ipv4_blocked(ntohl(v4.s_addr));
+    }
+    in6_addr v6{};
+    if (inet_pton(AF_INET6, ip, &v6) == 1) {
+        return ipv6_blocked(v6.s6_addr);
+    }
+    return true;
+}
+
+// CURLOPT_PREREQFUNCTION / CURLOPT_*PROTOCOLS_STR are enum values, not
+// preprocessor macros, so they must be gated on the library version, not with
+// defined(). PREREQFUNCTION: 7.80.0; PROTOCOLS_STR: 7.85.0.
+#define H2PDF_CURL_HAS_PREREQ (LIBCURL_VERSION_NUM >= 0x075000)
+#define H2PDF_CURL_HAS_PROTOCOLS_STR (LIBCURL_VERSION_NUM >= 0x075500)
+
+#if !H2PDF_CURL_HAS_PREREQ
+#warning "libcurl < 7.80.0: SSRF connection guard unavailable; only the http/https scheme restriction is enforced"
+#endif
+
+#if H2PDF_CURL_HAS_PREREQ
+// Called by libcurl after the connection is established but before the request
+// is sent, once per connection (so redirects are checked too). Aborts the
+// transfer when the resolved peer is a non-public address.
+int ssrf_prereq(void* /*clientp*/, char* conn_primary_ip, char* /*conn_local_ip*/,
+                int /*conn_primary_port*/, int /*conn_local_port*/) {
+    return is_blocked_ip(conn_primary_ip) ? CURL_PREREQFUNC_ABORT : CURL_PREREQFUNC_OK;
+}
+#endif
+
+// --- HTTP body sink with a size cap ---------------------------------------
+
+struct WriteCtx {
+    std::vector<unsigned char>* buf;
+    size_t limit;
+    bool exceeded;
+};
+
+size_t write_to_vector(char* ptr, size_t size, size_t nmemb, void* userdata) {
+    auto* ctx = static_cast<WriteCtx*>(userdata);
+    const size_t total = size * nmemb;
+    // buf->size() never exceeds limit, so the subtraction does not underflow.
+    if (total > ctx->limit - ctx->buf->size()) {
+        ctx->exceeded = true;
+        return 0;  // != total -> libcurl fails with CURLE_WRITE_ERROR
+    }
+    ctx->buf->insert(ctx->buf->end(), reinterpret_cast<unsigned char*>(ptr),
+                     reinterpret_cast<unsigned char*>(ptr) + total);
+    return total;
+}
+
+}  // namespace
+
+ResourceLoader::ResourceLoader(std::string user_agent, long timeout_sec,
+                               bool allow_local_network)
+    : user_agent_(std::move(user_agent)),
+      timeout_sec_(timeout_sec),
+      allow_local_network_(allow_local_network) {
+    ensure_curl_global();
+}
+
+ResourceLoader::~ResourceLoader() = default;
+
+void ResourceLoader::set_base(const std::string& base) {
+    base_ = base;
+    base_is_http_ = is_http_url(base);
+}
+
+FetchResult ResourceLoader::load_main(const std::string& src, bool is_url) {
+    if (is_url) {
+        // Only http(s) is accepted for the main URL; file:, ftp:, gopher:,
+        // dict:, ... are rejected to prevent local-file disclosure and
+        // protocol smuggling.
+        if (!is_http_url(src)) {
+            FetchResult r;
+            r.error = "unsupported URL scheme (only http/https supported): " + src;
+            return r;
+        }
+        set_base(src);
+        FetchResult r = load_http(src);
+        // After redirects, resolve sub-resources against the final location.
+        if (r.ok && !r.effective_url.empty()) set_base(r.effective_url);
+        return r;
+    }
+
+    set_base(src);
+    // Containment root: the canonical directory of the input file.
+    std::error_code ec;
+    fs::path dir = fs::path(src).parent_path();
+    if (dir.empty()) dir = fs::path(".");
+    fs::path canon = fs::weakly_canonical(fs::absolute(dir, ec), ec);
+    fs_root_ = ec ? dir.string() : canon.string();
+    return load_file(src);
+}
+
+std::string ResourceLoader::resolve(const std::string& ref, const std::string& base_in) {
+    if (ref.empty()) return "";
+
+    // Absolute URL with an explicit scheme: only http(s) is usable here; other
+    // schemes (file:, data:, ftp:, ...) are rejected.
+    if (has_scheme(ref)) return is_http_url(ref) ? ref : "";
+
+    std::string base;
+    bool base_http;
+    if (base_in.empty()) {
+        base = base_;
+        base_http = base_is_http_;
+    } else {
+        base = base_in;
+        base_http = is_http_url(base_in);
+    }
+
+    if (base_http) {
+        // Join the relative reference against the base URL via the CURLU API.
+        // On any failure return "" rather than the raw reference, so the result
+        // is never misrouted to the local filesystem.
+        CURLU* h = curl_url();
+        if (!h) return "";
+        std::string result;
+        if (curl_url_set(h, CURLUPART_URL, base.c_str(), 0) == CURLUE_OK &&
+            curl_url_set(h, CURLUPART_URL, ref.c_str(), 0) == CURLUE_OK) {
+            char* full = nullptr;
+            if (curl_url_get(h, CURLUPART_URL, &full, 0) == CURLUE_OK && full) {
+                result = full;
+                curl_free(full);
+            }
+        }
+        curl_url_cleanup(h);
+        return result;
+    }
+
+    // Filesystem base: join, then contain within the document root. Absolute
+    // paths and "../" escapes resolve outside the root and are rejected.
+    std::string candidate = (ref[0] == '/') ? ref : dir_of(base) + ref;
+    if (!path_within(fs_root_, candidate)) return "";
+    return candidate;
+}
+
+FetchResult ResourceLoader::load_resolved(const std::string& target) {
+    FetchResult r;
+    if (target.empty()) {
+        r.error = "unresolved or blocked reference";
+        return r;
+    }
+    if (is_http_url(target)) return load_http(target);
+    if (has_scheme(target)) {
+        r.error = "unsupported URL scheme: " + target;
+        return r;
+    }
+    return load_file(target);
+}
+
+FetchResult ResourceLoader::load_file(const std::string& path) {
+    FetchResult r;
+    std::error_code ec;
+    if (fs::is_directory(path, ec)) {
+        r.error = "not a regular file: " + path;
+        return r;
+    }
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        r.error = "cannot open file: " + path;
+        return r;
+    }
+    f.seekg(0, std::ios::end);
+    std::streamoff len = f.tellg();
+    f.seekg(0, std::ios::beg);
+    if (len < 0) {
+        // tellg() failed: the stream is not a normal seekable file.
+        r.error = "cannot determine file size: " + path;
+        return r;
+    }
+    if (len > 0) {
+        r.data.resize(static_cast<size_t>(len));
+        f.read(reinterpret_cast<char*>(r.data.data()), len);
+        if (!f && !f.eof()) {
+            r.error = "read error: " + path;
+            return r;
+        }
+        r.data.resize(static_cast<size_t>(f.gcount()));
+    }
+    r.ok = true;
+    return r;
+}
+
+FetchResult ResourceLoader::load_http(const std::string& url) {
+    FetchResult r;
+    CURL* curl = curl_easy_init();
+    if (!curl) {
+        r.error = "failed to initialise libcurl";
+        return r;
+    }
+
+    WriteCtx ctx{&r.data, kMaxResponseBytes, false};
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_sec_);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, timeout_sec_);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, user_agent_.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_to_vector);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
+    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");  // allow gzip/deflate
+    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 0L);
+    curl_easy_setopt(curl, CURLOPT_MAXFILESIZE_LARGE,
+                     static_cast<curl_off_t>(kMaxResponseBytes));
+
+    // Restrict to http/https for the initial request and for redirect targets,
+    // so a redirect cannot smuggle file:, gopher:, dict:, ... schemes.
+#if H2PDF_CURL_HAS_PROTOCOLS_STR
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+#else
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+#endif
+
+    // SSRF guard: reject connections whose resolved peer is a non-public
+    // address. The prereq callback runs per connection, so it covers redirects.
+#if H2PDF_CURL_HAS_PREREQ
+    if (!allow_local_network_) {
+        curl_easy_setopt(curl, CURLOPT_PREREQFUNCTION, ssrf_prereq);
+        curl_easy_setopt(curl, CURLOPT_PREREQDATA, nullptr);
+    }
+#endif
+
+    const CURLcode code = curl_easy_perform(curl);
+    if (code != CURLE_OK) {
+        r.data.clear();
+        if (ctx.exceeded) {
+            r.error = "response exceeds size limit (" +
+                      std::to_string(kMaxResponseBytes) + " bytes): " + url;
+        } else if (!allow_local_network_ && code == CURLE_ABORTED_BY_CALLBACK) {
+            r.error = "blocked non-public address (SSRF protection): " + url;
+        } else {
+            r.error = std::string("network error: ") + curl_easy_strerror(code);
+        }
+        curl_easy_cleanup(curl);
+        return r;
+    }
+
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    char* eff = nullptr;
+    if (curl_easy_getinfo(curl, CURLINFO_EFFECTIVE_URL, &eff) == CURLE_OK && eff) {
+        r.effective_url = eff;
+    }
+    curl_easy_cleanup(curl);
+
+    // For non-HTTP(S) schemes http_code may be 0; treat that as success since
+    // perform() already reported OK. For HTTP(S) require a 2xx status.
+    if (http_code != 0 && (http_code < 200 || http_code >= 300)) {
+        r.data.clear();
+        r.error = "HTTP status " + std::to_string(http_code) + " for " + url;
+        return r;
+    }
+
+    r.ok = true;
+    return r;
+}
+
+}  // namespace html2pdf
