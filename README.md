@@ -18,6 +18,8 @@ file extension. No Qt, GTK, headless browser or other heavy runtime is required.
   HTTP redirects are honoured.
 - Image decoding for PNG / JPEG / GIF / BMP via the vendored, public-domain
   [`stb_image`](https://github.com/nothings/stb).
+- Inline `data:` URIs (RFC 2397, base64 or percent-encoded) for images and
+  stylesheets, decoded in-process with no network or filesystem access.
 - Automatic content height (`--height` omitted) or a fixed canvas size; output
   dimensions are clamped to Cairo's surface limit (32767 px per side).
 - Graceful degradation: unreachable stylesheets/images never abort the render.
@@ -266,7 +268,8 @@ selected at build time: with the Pango backend it derives from
   surface and cached.
 - **Resource loading** (`get_image`, `load_image`, `import_css`) delegated to
   `ResourceLoader`, which resolves relative references against the document base
-  (filesystem directory, or via libcurl's `CURLU` API for URLs).
+  (filesystem directory, or via libcurl's `CURLU` API for URLs) and decodes
+  inline `data:` URIs without any I/O.
 
 The PDF output is a single page sized to the full content height (1px = 1pt);
 there is no pagination.

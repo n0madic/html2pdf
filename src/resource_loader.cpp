@@ -5,6 +5,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -42,6 +43,117 @@ bool has_scheme(const std::string& s) {
 
 bool is_http_url(const std::string& s) {
     return s.compare(0, 7, "http://") == 0 || s.compare(0, 8, "https://") == 0;
+}
+
+// True if `s` begins with the case-insensitive "data:" scheme (RFC 2397).
+bool is_data_uri(const std::string& s) {
+    if (s.size() < 5) return false;
+    static const char kData[5] = {'d', 'a', 't', 'a', ':'};
+    for (int i = 0; i < 5; ++i) {
+        if (std::tolower(static_cast<unsigned char>(s[i])) != kData[i]) return false;
+    }
+    return true;
+}
+
+// Decode RFC 4648 base64 from `in` into `out`, tolerating embedded ASCII
+// whitespace and omitted '=' padding. Returns false on an invalid character,
+// data after padding, or an impossible 4n+1 length.
+bool base64_decode(const std::string& in, std::vector<unsigned char>& out) {
+    auto sextet = [](unsigned char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    };
+    uint32_t acc = 0;
+    int bits = 0;
+    bool padded = false;
+    for (unsigned char c : in) {
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' || c == '\v') continue;
+        if (c == '=') { padded = true; continue; }
+        if (padded) return false;  // data after padding
+        const int v = sextet(c);
+        if (v < 0) return false;
+        acc = (acc << 6) | static_cast<uint32_t>(v);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<unsigned char>((acc >> bits) & 0xFFu));
+        }
+    }
+    // A lone trailing sextet leaves 6 unconsumed bits and cannot form a byte.
+    return bits != 6;
+}
+
+// Decode percent-encoding (%XX) from `in` into `out`. A stray or truncated '%'
+// is emitted literally, matching lenient browser handling of data: URIs.
+void percent_decode(const std::string& in, std::vector<unsigned char>& out) {
+    auto nibble = [](unsigned char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (size_t i = 0; i < in.size(); ++i) {
+        if (in[i] == '%' && i + 2 < in.size()) {
+            const int hi = nibble(static_cast<unsigned char>(in[i + 1]));
+            const int lo = nibble(static_cast<unsigned char>(in[i + 2]));
+            if (hi >= 0 && lo >= 0) {
+                out.push_back(static_cast<unsigned char>((hi << 4) | lo));
+                i += 2;
+                continue;
+            }
+        }
+        out.push_back(static_cast<unsigned char>(in[i]));
+    }
+}
+
+// Decode a data: URI (data:[<mediatype>][;base64],<data>) into its raw bytes.
+// The media type is ignored: stb_image sniffs image formats by content and CSS
+// is consumed as text, so only the payload matters. A data: URI is
+// self-contained -> no network or filesystem access, so neither the SSRF guard
+// nor filesystem containment applies.
+FetchResult load_data_uri(const std::string& uri) {
+    FetchResult r;
+    const size_t comma = uri.find(',');
+    if (comma == std::string::npos) {
+        r.error = "malformed data: URI (missing comma)";
+        return r;
+    }
+    // Metadata sits between "data:" (5 chars) and the comma; the payload is
+    // base64 when it ends with ";base64" (case-insensitive, trailing spaces
+    // ignored), otherwise it is percent-encoded text.
+    std::string meta = uri.substr(5, comma - 5);
+    const size_t last = meta.find_last_not_of(" \t");
+    meta.resize(last == std::string::npos ? 0 : last + 1);
+
+    bool base64 = false;
+    static const std::string kTag = ";base64";
+    if (meta.size() >= kTag.size()) {
+        base64 = true;
+        const size_t off = meta.size() - kTag.size();
+        for (size_t i = 0; i < kTag.size(); ++i) {
+            if (std::tolower(static_cast<unsigned char>(meta[off + i])) != kTag[i]) {
+                base64 = false;
+                break;
+            }
+        }
+    }
+
+    const std::string payload = uri.substr(comma + 1);
+    if (base64) {
+        if (!base64_decode(payload, r.data)) {
+            r.data.clear();
+            r.error = "invalid base64 in data: URI";
+            return r;
+        }
+    } else {
+        percent_decode(payload, r.data);
+    }
+    r.ok = true;
+    return r;
 }
 
 // Directory part of a filesystem path, including the trailing separator.
@@ -225,8 +337,12 @@ FetchResult ResourceLoader::load_main(const std::string& src, bool is_url) {
 std::string ResourceLoader::resolve(const std::string& ref, const std::string& base_in) {
     if (ref.empty()) return "";
 
+    // data: URIs are self-contained (RFC 2397): pass them through unchanged so
+    // load_resolved() can decode the inline payload. No base join applies.
+    if (is_data_uri(ref)) return ref;
+
     // Absolute URL with an explicit scheme: only http(s) is usable here; other
-    // schemes (file:, data:, ftp:, ...) are rejected.
+    // schemes (file:, ftp:, gopher:, ...) are rejected.
     if (has_scheme(ref)) return is_http_url(ref) ? ref : "";
 
     std::string base;
@@ -271,6 +387,7 @@ FetchResult ResourceLoader::load_resolved(const std::string& target) {
         r.error = "unresolved or blocked reference";
         return r;
     }
+    if (is_data_uri(target)) return load_data_uri(target);
     if (is_http_url(target)) return load_http(target);
     if (has_scheme(target)) {
         r.error = "unsupported URL scheme: " + target;

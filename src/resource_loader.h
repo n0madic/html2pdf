@@ -18,9 +18,12 @@ struct FetchResult {
 // Unified loader for the main document and for sub-resources (CSS, images),
 // from the local filesystem or over HTTP(S). Relative references are resolved
 // against a base set with set_base() (or an explicit per-reference base).
+// Sub-resources may also be inline data: URIs (RFC 2397), decoded in-process
+// with no network or filesystem access.
 //
 // Security:
-//   - Only http/https URLs are accepted (file:, ftp:, gopher:, ... are rejected).
+//   - Only http/https URLs are accepted (file:, ftp:, gopher:, ... are rejected);
+//     inline data: URIs are decoded locally and touch neither the network nor disk.
 //   - HTTP fetches are guarded against SSRF: connections to loopback, private,
 //     link-local (incl. cloud metadata 169.254.169.254) and other non-public
 //     addresses are blocked unless allow_local_network is set.

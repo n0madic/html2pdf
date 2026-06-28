@@ -93,6 +93,32 @@ EOF
 expect_code 0 $? "unreachable resources -> still renders"
 
 # ----------------------------------------------------------------------------
+echo "[2h] inline data: URI image is decoded and embedded (no fetch)"
+# datauri.html embeds a 100x300 base64 PNG. With auto-height the page height
+# tracks the image's natural size ONLY if the data: URI decodes; a non-decoded
+# image collapses to ~0, so the height assertion is the functional check.
+"$BIN" --input "$FIX/datauri.html" --output "$OUT/datauri.png" >/dev/null 2>&1
+expect_code 0 $? "data: URI image -> png"
+expect_magic "$OUT/datauri.png" $'\x89PNG' "datauri.png magic"
+"$BIN" --input "$FIX/datauri.html" --output "$OUT/datauri.pdf" >/dev/null 2>&1
+expect_code 0 $? "data: URI image -> pdf"
+expect_magic "$OUT/datauri.pdf" '%PDF' "datauri.pdf magic"
+DUH="$(png_height "$OUT/datauri.png")"
+if [[ -n "$DUH" ]]; then
+    if [[ "$DUH" -gt 250 ]]; then
+        ok "data: URI image decoded (height $DUH tracks 300px image)"
+    else
+        bad "data: URI image not decoded (height $DUH, expected > 250)"
+    fi
+fi
+
+# A malformed data: URI must degrade gracefully, not abort the render.
+DBAD="$OUT/databad.html"
+printf '<!DOCTYPE html><html><body><img src="data:image/png;base64,@@@not-base64"></body></html>' > "$DBAD"
+"$BIN" --input "$DBAD" --output "$OUT/databad.png" >/dev/null 2>&1
+expect_code 0 $? "malformed data: URI -> still renders"
+
+# ----------------------------------------------------------------------------
 echo "[2c] HTTP fetch, URL resolution and SSRF guard (optional, needs python3)"
 if command -v python3 >/dev/null 2>&1; then
     PORT=8731
