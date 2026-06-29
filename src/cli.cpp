@@ -1,9 +1,13 @@
 #include "cli.h"
 
+#include <cerrno>
 #include <charconv>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <utility>
 
 namespace html2pdf {
 
@@ -33,6 +37,81 @@ bool parse_number(const std::string& s, T& out) {
     const char* end = s.data() + s.size();
     auto [ptr, ec] = std::from_chars(begin, end, out);
     return ec == std::errc() && ptr == end;
+}
+
+// Strictly parse a floating-point value: the whole string must be consumed and
+// the result must be finite. std::from_chars<double> is unavailable on some
+// libstdc++/libc++ versions, so use strtod and check the end pointer ourselves.
+bool parse_double(const std::string& s, double& out) {
+    if (s.empty()) return false;
+    const char* begin = s.c_str();
+    char* end = nullptr;
+    errno = 0;
+    const double v = std::strtod(begin, &end);
+    if (end != begin + s.size()) return false;  // trailing garbage
+    if (!std::isfinite(v)) return false;
+    out = v;
+    return true;
+}
+
+// Resolve a paper-size spec to width/height in PDF points (portrait), then swap
+// for landscape. The spec is either a preset name (case-insensitive) or a
+// "WxH[unit]" custom size where unit is one of mm|cm|in|pt (default mm).
+// Returns false on an unknown preset, malformed custom size, or non-positive
+// dimensions.
+bool resolve_page_size(const std::string& spec, bool landscape, double& w_pt, double& h_pt) {
+    // Preset table, portrait orientation, in points (1pt = 1/72 inch).
+    struct Preset { const char* name; double w; double h; };
+    static const Preset kPresets[] = {
+        {"a3",     841.89, 1190.55},
+        {"a4",     595.28,  841.89},
+        {"a5",     419.53,  595.28},
+        {"letter", 612.0,   792.0},
+        {"legal",  612.0,  1008.0},
+    };
+
+    double w = 0.0, h = 0.0;
+    const std::string lower = to_lower(spec);
+    bool resolved = false;
+    for (const Preset& p : kPresets) {
+        if (lower == p.name) {
+            w = p.w;
+            h = p.h;
+            resolved = true;
+            break;
+        }
+    }
+
+    if (!resolved) {
+        // Custom "WxH[unit]" form. Split on the first 'x'.
+        const auto xpos = lower.find('x');
+        if (xpos == std::string::npos || xpos == 0 || xpos + 1 >= lower.size()) return false;
+        const std::string w_str = lower.substr(0, xpos);
+        std::string h_str = lower.substr(xpos + 1);
+
+        // Trailing unit on the height part: mm|cm|in|pt (default mm).
+        double factor = 72.0 / 25.4;  // mm -> pt
+        const std::pair<const char*, double> units[] = {
+            {"mm", 72.0 / 25.4}, {"cm", 72.0 / 2.54}, {"in", 72.0}, {"pt", 1.0},
+        };
+        for (const auto& u : units) {
+            if (ends_with(h_str, u.first)) {
+                factor = u.second;
+                h_str.erase(h_str.size() - 2);
+                break;
+            }
+        }
+
+        if (!parse_double(w_str, w) || !parse_double(h_str, h)) return false;
+        w *= factor;
+        h *= factor;
+    }
+
+    if (!(w > 0.0) || !(h > 0.0)) return false;
+    if (landscape) std::swap(w, h);
+    w_pt = w;
+    h_pt = h;
+    return true;
 }
 
 // Pull the value for an option that expects an argument. Supports both
@@ -69,6 +148,13 @@ void print_usage(const char* prog) {
         "Options:\n"
         "  --width N           Render width in pixels (default: 1024)\n"
         "  --height N          Render height in pixels (default: 0 = auto)\n"
+        "  --page-size SIZE    Paginate PDF output to this paper size; SIZE is a\n"
+        "                      preset (A3, A4, A5, Letter, Legal) or a custom\n"
+        "                      WxH[unit] (unit mm|cm|in|pt, default mm). Without\n"
+        "                      this flag the PDF is a single page (the default).\n"
+        "                      PDF output only; overrides --height when set.\n"
+        "  --landscape         Rotate the --page-size paper to landscape\n"
+        "  --margin MM         Page margin in millimetres (default: 10; needs --page-size)\n"
         "  --user-agent STR    HTTP User-Agent header (default: html2pdf/1.0)\n"
         "  --timeout N         HTTP timeout in seconds (default: 30)\n"
         "  --allow-local-network\n"
@@ -143,6 +229,18 @@ ParseResult parse_args(int argc, char** argv) {
                 std::cerr << "error: --height must be an integer: " << value << "\n";
                 return result;
             }
+        } else if (name == "--page-size") {
+            if (!need()) return result;
+            opts.page_size = value;
+        } else if (name == "--landscape") {
+            // Boolean flag: rotate the paper size (only with --page-size).
+            opts.landscape = true;
+        } else if (name == "--margin") {
+            if (!need()) return result;
+            if (!parse_double(value, opts.margin_mm)) {
+                std::cerr << "error: --margin must be a number (mm): " << value << "\n";
+                return result;
+            }
         } else if (name == "--user-agent") {
             if (!need()) return result;
             opts.user_agent = value;
@@ -203,6 +301,30 @@ ParseResult parse_args(int argc, char** argv) {
     if (opts.timeout_sec <= 0) {
         std::cerr << "error: --timeout must be a positive integer\n";
         return result;
+    }
+
+    // Validation: pagination. --page-size enables it; --landscape/--margin only
+    // take effect alongside it. --height is ignored in paged mode (height is
+    // determined by the paper size and page breaks).
+    if (!opts.page_size.empty()) {
+        if (opts.format != Format::PDF) {
+            std::cerr << "error: --page-size requires PDF output\n";
+            return result;
+        }
+        if (!resolve_page_size(opts.page_size, opts.landscape, opts.page_w_pt, opts.page_h_pt)) {
+            std::cerr << "error: invalid --page-size: " << opts.page_size << "\n";
+            return result;
+        }
+        if (opts.margin_mm < 0.0) {
+            std::cerr << "error: --margin must be zero or positive\n";
+            return result;
+        }
+        opts.margin_pt = opts.margin_mm * 72.0 / 25.4;
+        // Margins must leave a positive printable area on both axes.
+        if (2.0 * opts.margin_pt >= opts.page_w_pt || 2.0 * opts.margin_pt >= opts.page_h_pt) {
+            std::cerr << "error: --margin too large for the page size\n";
+            return result;
+        }
     }
 
     result.status = ParseResult::Status::Ok;

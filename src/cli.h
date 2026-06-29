@@ -18,6 +18,17 @@ struct Options {
     long timeout_sec = 30;   // --timeout (seconds)
     bool allow_local_network = false;  // --allow-local-network (disables SSRF guard)
     Format format = Format::PNG;  // derived from output extension
+
+    // Pagination (PDF only). When --page-size is given, the PDF is split into
+    // pages of that paper size; otherwise output stays a single page (default).
+    std::string page_size;          // --page-size: preset or WxH[unit]; empty = single page
+    bool        landscape  = false; // --landscape (only meaningful with --page-size)
+    double      margin_mm  = 10.0;  // --margin in millimetres (only with --page-size)
+    // Resolved geometry, filled by parse_args when page_size is non-empty.
+    // page_w_pt > 0 signals "paginate"; all values are in PDF points (1/72 in).
+    double      page_w_pt  = 0.0;
+    double      page_h_pt  = 0.0;
+    double      margin_pt  = 0.0;
 };
 
 // Result of parsing the command line.

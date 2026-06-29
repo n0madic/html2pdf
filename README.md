@@ -11,7 +11,9 @@ file extension. No Qt, GTK, headless browser or other heavy runtime is required.
 ## Features
 
 - Render local files (`--input`) or remote pages (`--url`, HTTP/HTTPS via libcurl).
-- PNG (raster) and PDF (single page, vector) output, chosen by file extension.
+- PNG (raster) and PDF (vector) output, chosen by file extension. PDF is a single
+  page by default, or paginated to a paper size (`--page-size A4`, `Letter`, …)
+  with content scaled to fit the page width and breaks at box boundaries.
 - External resources — stylesheets (`<link>`, `@import`) and images — are fetched
   relative to their own base: a stylesheet's `url(...)` and nested `@import`
   resolve against the stylesheet's location, and a relative `<base href>` and
@@ -46,8 +48,11 @@ mandatory. The output format is taken from the extension (`.png` or `.pdf`).
 | `--input FILE`     | —             | Render a local HTML file |
 | `--url URL`        | —             | Fetch and render an HTTP(S) URL |
 | `--output FILE`    | —             | Output path; `.png` or `.pdf` picks the format |
-| `--width N`        | `1024`        | Render width in pixels |
-| `--height N`       | `0` (auto)    | Render height in pixels; `0` = content height |
+| `--width N`        | `1024`        | Render width in pixels (drives layout / line breaks) |
+| `--height N`       | `0` (auto)    | Render height in pixels; `0` = content height (ignored with `--page-size`) |
+| `--page-size SIZE` | — (single page) | Paginate **PDF** output to a paper size: a preset (`A3`, `A4`, `A5`, `Letter`, `Legal`) or a custom `WxH[unit]` (`unit` = `mm`\|`cm`\|`in`\|`pt`, default `mm`). PDF-only flag; without it the PDF is a single page |
+| `--landscape`      | off           | Rotate the `--page-size` paper to landscape |
+| `--margin MM`      | `10`          | Page margin in millimetres (only with `--page-size`) |
 | `--user-agent STR` | `html2pdf/1.0`| HTTP `User-Agent` header |
 | `--timeout N`      | `30`          | HTTP timeout in seconds |
 | `--allow-local-network` | off      | Allow fetching loopback/private/link-local hosts (disables the SSRF guard) |
@@ -61,6 +66,13 @@ html2pdf --input page.html --output page.png
 
 # Local file to a single-page PDF
 html2pdf --input page.html --output page.pdf
+
+# Paginated A4 PDF (content scaled to the page width, breaks at box boundaries)
+html2pdf --input page.html --output page.pdf --page-size A4
+
+# Landscape Letter with a 20 mm margin, or a custom page size
+html2pdf --input page.html --output page.pdf --page-size Letter --landscape --margin 20
+html2pdf --input page.html --output page.pdf --page-size 210x297mm
 
 # Remote page to a fixed-size PNG
 html2pdf --url https://example.com/ --output example.png --width 1280 --height 720
@@ -271,8 +283,15 @@ selected at build time: with the Pango backend it derives from
   (filesystem directory, or via libcurl's `CURLU` API for URLs) and decodes
   inline `data:` URIs without any I/O.
 
-The PDF output is a single page sized to the full content height (1px = 1pt);
-there is no pagination.
+By default the PDF output is a single page sized to the full content height
+(1px = 1pt). With `--page-size` the document is paginated instead: the layout is
+rendered at `--width` and then scaled so its full content width — `max(--width,
+doc->width())`, which includes any horizontal overflow — fits the printable
+width, so wide content (e.g. a table wider than `--width`) is shrunk to fit
+rather than clipped. Pages break vertically at box boundaries — blocks, table
+rows (`<tr>`) and text lines — found by walking the litehtml render tree; rows
+and lines are never cut mid-height. An element taller than a single page is
+hard-cut, since it cannot be placed whole.
 
 ## Testing
 
@@ -289,9 +308,12 @@ HTTP tests additionally assert URL resolution from the server access log
 (per-resource stylesheet base, relative `<base href>`, post-redirect base), and
 a security/robustness section covers scheme rejection, the SSRF guard,
 filesystem containment, strict numeric parsing, output-dimension clamping and
-file-I/O exit codes. It checks exit codes, output-file magic bytes and (where
-relevant) requested URLs, and is backend-agnostic (passes with either text
-backend).
+file-I/O exit codes. A pagination section (`--page-size`) checks that a tall page
+splits into multiple A4 pages (page count via `python3`, gated on availability),
+that landscape and custom sizes render, that a wide table is accepted, and that
+the default PDF stays a single page. It checks exit codes, output-file magic
+bytes and (where relevant) requested URLs, and is backend-agnostic (passes with
+either text backend).
 
 `tests/fixtures/unicode.html` (CJK, RTL, diacritics, emoji, wavy decoration) is
 included for a manual visual comparison of the two backends; the automated test
@@ -306,5 +328,8 @@ only checks that it renders to a valid file.
   subject to the relevant fonts being installed on the system.
 - Only PNG / JPEG / GIF / BMP images are decoded; others (e.g. SVG, WebP) are
   skipped without error.
-- PDF output is a single, un-paginated page. A4/Letter pagination is a possible
-  future extension.
+- PDF pagination (`--page-size`) breaks at box boundaries detected from the
+  render tree, because litehtml has no CSS fragmentation support: the CSS
+  `page-break-*` / `break-inside` properties are ignored, table headers
+  (`<thead>`) are not repeated on each page, and a single row, line or element
+  taller than the printable area is hard-cut.

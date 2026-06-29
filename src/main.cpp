@@ -76,6 +76,14 @@ int main(int argc, char** argv) {
 
     doc->render(static_cast<litehtml::pixel_t>(opts.width));
 
+    // 3b. Paginated PDF: split into fixed-size pages. The layout width drives
+    // line breaks; content is scaled to fit the page width, so there is no
+    // canvas-dimension clamp here (height is split across pages, width auto-fit).
+    if (opts.format == Format::PDF && opts.page_w_pt > 0.0) {
+        return render_to_pdf_paged(doc, opts.width, opts.page_w_pt, opts.page_h_pt,
+                                   opts.margin_pt, opts.output);
+    }
+
     // 4. Determine output dimensions. Height defaults to the content height.
     // Both are clamped to the Cairo surface limit (and never narrowed unsafely).
     const double raw_w = static_cast<double>(opts.width);

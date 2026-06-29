@@ -52,6 +52,55 @@ png_height() {
     file -b "$1" | sed -nE 's/.*[0-9]+ x ([0-9]+).*/\1/p'
 }
 
+# Echo the number of pages in a PDF, or nothing if python3 is unavailable.
+# Cairo compresses the page tree into Flate object streams, so plain text has no
+# "/Type /Page"; decompress every stream first, then count the page objects.
+pdf_pages() {
+    command -v python3 >/dev/null 2>&1 || return 0
+    python3 - "$1" <<'PY'
+import sys, re, zlib
+data = open(sys.argv[1], 'rb').read()
+blob = bytearray(data)
+for m in re.finditer(rb'stream\r?\n', data):
+    start = m.end()
+    end = data.find(b'endstream', start)
+    if end < 0:
+        continue
+    try:
+        blob += zlib.decompress(data[start:end])
+    except Exception:
+        pass
+print(len(re.findall(rb'/Type\s*/Page(?![s])', blob)))
+PY
+}
+
+# Echo the minimum number of drawing operators across all PDF page content
+# streams (or nothing if python3 is unavailable). Cell borders / fills emit
+# re/f/S/l/m operators in every text backend, so a real page scores in the
+# thousands while a near-empty page (the symptom of a broken page break that
+# lands inside a zero-height table wrapper) scores near zero.
+pdf_min_page_ops() {
+    command -v python3 >/dev/null 2>&1 || return 0
+    python3 - "$1" <<'PY'
+import sys, re, zlib
+data = open(sys.argv[1], 'rb').read()
+ops = []
+for m in re.finditer(rb'stream\r?\n', data):
+    start = m.end()
+    end = data.find(b'endstream', start)
+    if end < 0:
+        continue
+    try:
+        d = zlib.decompress(data[start:end])
+    except Exception:
+        continue
+    # Only page content streams carry path/text operators.
+    if b' re' in d or b'BT' in d or b' l\n' in d or b' m\n' in d:
+        ops.append(len(re.findall(rb'\b(re|Tj|TJ|f|S|l|m)\b', d)))
+print(min(ops) if ops else 0)
+PY
+}
+
 # Assert a file contains (expect_grep) / does not contain (expect_no_grep) a
 # pattern. Used to verify which URLs the renderer actually requested.
 expect_grep() {
@@ -270,6 +319,16 @@ expect_code 1 $? "--width overflow rejected -> code 1"
 "$BIN" --input "$FIX/simple.html" --output "$OUT/x.png" --height abc >/dev/null 2>&1
 expect_code 1 $? "--height abc rejected -> code 1"
 
+# Pagination options are PDF-only and bounds-checked (see [7] for behaviour).
+"$BIN" --input "$FIX/simple.html" --output "$OUT/x.png" --page-size A4 >/dev/null 2>&1
+expect_code 1 $? "--page-size with PNG output -> code 1"
+"$BIN" --input "$FIX/simple.html" --output "$OUT/x.pdf" --page-size B7 >/dev/null 2>&1
+expect_code 1 $? "unknown --page-size preset -> code 1"
+"$BIN" --input "$FIX/simple.html" --output "$OUT/x.pdf" --page-size A4 --margin 200 >/dev/null 2>&1
+expect_code 1 $? "--margin too large for page -> code 1"
+"$BIN" --input "$FIX/simple.html" --output "$OUT/x.pdf" --page-size A4 --margin -1 >/dev/null 2>&1
+expect_code 1 $? "negative --margin -> code 1"
+
 # Output write failure is a file I/O error (code 2), not a graphics error.
 "$BIN" --input "$FIX/simple.html" --output "/no/such/dir/out.png" >/dev/null 2>&1
 expect_code 2 $? "unwritable PNG destination -> code 2"
@@ -308,6 +367,70 @@ if [[ -n "$EH" && -n "$IH" ]]; then
         ok "in-tree stylesheet applied (height $IH)"
     else
         bad "in-tree stylesheet not applied (height $IH)"
+    fi
+fi
+
+# ----------------------------------------------------------------------------
+echo "[7] PDF pagination (--page-size)"
+# A tall page split into A4 pages: must succeed and produce more than one page.
+"$BIN" --input "$FIX/paged.html" --output "$OUT/paged_a4.pdf" --page-size A4 >/dev/null 2>&1
+expect_code 0 $? "paged -> A4 pdf"
+expect_magic "$OUT/paged_a4.pdf" '%PDF' "paged_a4.pdf magic"
+PAGES="$(pdf_pages "$OUT/paged_a4.pdf")"
+if [[ -n "$PAGES" ]]; then
+    if [[ "$PAGES" -gt 1 ]]; then
+        ok "paged A4 split into multiple pages ($PAGES)"
+    else
+        bad "paged A4 not paginated (pages=$PAGES, expected > 1)"
+    fi
+else
+    echo "  SKIP: python3 not available (page count)"
+fi
+
+# Landscape rotates the paper; custom WxH spec is accepted.
+"$BIN" --input "$FIX/tall.html" --output "$OUT/tall_a4l.pdf" --page-size A4 --landscape >/dev/null 2>&1
+expect_code 0 $? "tall -> A4 landscape pdf"
+expect_magic "$OUT/tall_a4l.pdf" '%PDF' "tall_a4l.pdf magic"
+
+"$BIN" --input "$FIX/tall.html" --output "$OUT/tall_custom.pdf" --page-size 210x297mm >/dev/null 2>&1
+expect_code 0 $? "tall -> custom 210x297mm pdf"
+expect_magic "$OUT/tall_custom.pdf" '%PDF' "tall_custom.pdf magic"
+
+# A wide, multi-page table: wider than --width (scaled to fit, not clipped) and
+# tall enough to span several pages (must break between <tr> rows). Regression
+# guard: litehtml table row-groups/rows report height()==0, so a naive tree walk
+# breaks the page at a zero-height wrapper and emits a near-empty page. Assert
+# the table paginates AND no page is near-empty (min drawing ops well above 0).
+"$BIN" --input "$FIX/wide_table.html" --output "$OUT/wide_table_a4.pdf" --page-size A4 >/dev/null 2>&1
+expect_code 0 $? "wide table -> A4 pdf (scaled to fit, not clipped)"
+expect_magic "$OUT/wide_table_a4.pdf" '%PDF' "wide_table_a4.pdf magic"
+WT_PAGES="$(pdf_pages "$OUT/wide_table_a4.pdf")"
+WT_MINOPS="$(pdf_min_page_ops "$OUT/wide_table_a4.pdf")"
+if [[ -n "$WT_PAGES" && -n "$WT_MINOPS" ]]; then
+    if [[ "$WT_PAGES" -gt 1 ]]; then
+        ok "wide table paginates ($WT_PAGES pages)"
+    else
+        bad "wide table not paginated (pages=$WT_PAGES, expected > 1)"
+    fi
+    # Real pages score in the thousands; a near-empty page (the bug) scores ~0.
+    if [[ "$WT_MINOPS" -gt 1000 ]]; then
+        ok "no near-empty table page (min ops $WT_MINOPS, rows break at <tr>)"
+    else
+        bad "near-empty table page detected (min ops $WT_MINOPS, broken row-group break)"
+    fi
+else
+    echo "  SKIP: python3 not available (table page checks)"
+fi
+
+# Default behaviour is unchanged: without --page-size the PDF stays single-page.
+"$BIN" --input "$FIX/tall.html" --output "$OUT/tall_default.pdf" >/dev/null 2>&1
+expect_code 0 $? "tall -> single-page pdf (no --page-size)"
+DEF_PAGES="$(pdf_pages "$OUT/tall_default.pdf")"
+if [[ -n "$DEF_PAGES" ]]; then
+    if [[ "$DEF_PAGES" -eq 1 ]]; then
+        ok "default PDF stays a single page ($DEF_PAGES)"
+    else
+        bad "default PDF unexpectedly paginated (pages=$DEF_PAGES, expected 1)"
     fi
 fi
 
