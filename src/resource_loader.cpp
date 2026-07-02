@@ -8,6 +8,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -25,7 +26,12 @@ constexpr size_t kMaxResponseBytes = 64u * 1024u * 1024u;  // 64 MiB
 std::once_flag g_curl_once;
 
 void ensure_curl_global() {
-    std::call_once(g_curl_once, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
+    std::call_once(g_curl_once, [] {
+        curl_global_init(CURL_GLOBAL_DEFAULT);
+        // Pair the one-time global init with a matching teardown at process
+        // exit, so libcurl's global allocations are released cleanly.
+        std::atexit(curl_global_cleanup);
+    });
 }
 
 // True if the string starts with "scheme://".
@@ -381,19 +387,30 @@ std::string ResourceLoader::resolve(const std::string& ref, const std::string& b
     return candidate;
 }
 
-FetchResult ResourceLoader::load_resolved(const std::string& target) {
-    FetchResult r;
+FetchResult ResourceLoader::load_resolved(const std::string& target, bool use_cache) {
     if (target.empty()) {
+        FetchResult r;
         r.error = "unresolved or blocked reference";
         return r;
     }
-    if (is_data_uri(target)) return load_data_uri(target);
-    if (is_http_url(target)) return load_http(target);
-    if (has_scheme(target)) {
-        r.error = "unsupported URL scheme: " + target;
-        return r;
+    if (use_cache) {
+        const auto it = response_cache_.find(target);
+        if (it != response_cache_.end()) return it->second;
     }
-    return load_file(target);
+
+    FetchResult r;
+    if (is_data_uri(target)) {
+        r = load_data_uri(target);
+    } else if (is_http_url(target)) {
+        r = load_http(target);
+    } else if (has_scheme(target)) {
+        r.error = "unsupported URL scheme: " + target;
+    } else {
+        r = load_file(target);
+    }
+
+    if (use_cache) response_cache_.emplace(target, r);
+    return r;
 }
 
 FetchResult ResourceLoader::load_file(const std::string& path) {

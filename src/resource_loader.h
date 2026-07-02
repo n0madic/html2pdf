@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace html2pdf {
@@ -52,8 +53,12 @@ public:
     std::string resolve(const std::string& ref, const std::string& base = "");
 
     // Load an already-resolved absolute URL/path. Does no further resolution; an
-    // empty target yields an error result.
-    FetchResult load_resolved(const std::string& target);
+    // empty target yields an error result. Pass use_cache=true to memoize the
+    // result by target: CSS is requested twice (the web-font pre-scan and
+    // litehtml's import_css both fetch every @import), so caching it avoids a
+    // duplicate network round-trip. Images and fonts are fetched at most once
+    // elsewhere and use the default (false) so their bytes are not retained.
+    FetchResult load_resolved(const std::string& target, bool use_cache = false);
 
 private:
     FetchResult load_file(const std::string& path);
@@ -67,6 +72,10 @@ private:
     // Canonical directory of the main input file; filesystem sub-resources are
     // contained within it. Empty in HTTP mode.
     std::string fs_root_;
+    // Response cache for resources fetched more than once (CSS via @import, seen
+    // by both the web-font pre-scan and litehtml's import_css). Keyed on the
+    // resolved absolute URL/path; only populated when load_resolved(..., true).
+    std::unordered_map<std::string, FetchResult> response_cache_;
 };
 
 }  // namespace html2pdf

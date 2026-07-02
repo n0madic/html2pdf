@@ -73,6 +73,11 @@ private:
     std::size_t font_file_counter_ = 0;
     bool fontconfig_available_ = false;
     bool installed_any_font_ = false;
+    // The process default PangoFontMap displaced by activate_fontconfig_backend()
+    // (an owned ref), restored in cleanup() so the global swap is scoped to this
+    // manager. Non-null iff a swap happened. Held as void* to keep this header
+    // free of Pango/GLib includes; cast to PangoCairoFontMap* in the .cpp.
+    void* prev_default_map_ = nullptr;
 };
 
 }  // namespace html2pdf

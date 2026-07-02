@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <functional>
+#include <string>
 
 #include <litehtml/html.h>
 
@@ -75,6 +77,21 @@ std::string pango_family_list(const std::string& css_families,
 // Premultiply one 8-bit channel by alpha with rounding.
 inline uint8_t premul(uint8_t c, uint8_t a) {
     return static_cast<uint8_t>((static_cast<int>(c) * a + 127) / 255);
+}
+
+// Compact key for the image cache. Ordinary URLs/paths pass through unchanged,
+// but a (possibly huge) data: URI is collapsed to a fixed-size digest so the raw
+// URI is not retained as a map key — wasteful in particular when a large payload
+// fails to decode to an image. A collision within one document would need two
+// distinct data: URIs of identical length AND identical 64-bit hash, which is
+// astronomically unlikely.
+std::string image_cache_key(const std::string& url) {
+    const bool is_data =
+        url.size() >= 5 && (url[0] == 'd' || url[0] == 'D') && (url[1] == 'a' || url[1] == 'A') &&
+        (url[2] == 't' || url[2] == 'T') && (url[3] == 'a' || url[3] == 'A') && url[4] == ':';
+    if (!is_data) return url;
+    return "data:#" + std::to_string(url.size()) + ":" +
+           std::to_string(std::hash<std::string>{}(url));
 }
 
 }  // namespace
@@ -330,8 +347,10 @@ void HtmlContainer::make_url(const char* url, const char* basepath, litehtml::st
 
 cairo_surface_t* HtmlContainer::get_image(const std::string& url) {
     // `url` has already been resolved to an absolute URL/path by make_url();
-    // an empty string means the reference was unresolvable or blocked.
-    auto it = image_cache_.find(url);
+    // an empty string means the reference was unresolvable or blocked. The cache
+    // is keyed on a compact digest so a large data: URI is not held verbatim.
+    const std::string key = image_cache_key(url);
+    auto it = image_cache_.find(key);
     if (it != image_cache_.end()) {
         // Return an extra reference for the caller; null stays null.
         return it->second ? cairo_surface_reference(it->second) : nullptr;
@@ -373,7 +392,7 @@ cairo_surface_t* HtmlContainer::get_image(const std::string& url) {
         if (pixels) stbi_image_free(pixels);
     }
 
-    image_cache_[url] = surface;  // cache owns one reference (or null)
+    image_cache_[key] = surface;  // cache owns one reference (or null)
     return surface ? cairo_surface_reference(surface) : nullptr;
 }
 
@@ -395,7 +414,8 @@ void HtmlContainer::import_css(litehtml::string& text, const litehtml::string& u
     // parent sheet's location, or the document base when empty).
     const std::string resolved = loader_.resolve(url, baseurl);
     if (resolved.empty()) return;  // unresolvable / blocked
-    FetchResult fr = loader_.load_resolved(resolved);
+    // Cache: the web-font pre-scan may have already fetched this same @import.
+    FetchResult fr = loader_.load_resolved(resolved, /*use_cache=*/true);
     if (fr.ok && !fr.data.empty()) {
         text.assign(reinterpret_cast<const char*>(fr.data.data()), fr.data.size());
 #ifdef HTML2PDF_USE_PANGO

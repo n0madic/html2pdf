@@ -115,9 +115,24 @@ int parse_weight_value(const litehtml::css_token_vector& tokens) {
         if (ident == "normal") return 400;
         if (ident == "bold") return 700;
     }
-    if (tok.type == litehtml::NUMBER) {
-        const int weight = static_cast<int>(std::lround(tok.n.number));
-        if (weight >= 1 && weight <= 1000) return weight;
+    // Collect the numeric values: a single value is a fixed weight; two values
+    // are a variable-font range ("400 700"). A single registered face can carry
+    // only one FC_WEIGHT, so represent a range by 400 when it falls inside (so
+    // normal-weight text matches), otherwise by the nearest bound.
+    int nums[2] = {0, 0};
+    int count = 0;
+    for (const auto& t : tokens) {
+        if (t.type != litehtml::NUMBER) continue;
+        const int weight = static_cast<int>(std::lround(t.n.number));
+        if (weight < 1 || weight > 1000) continue;
+        nums[count++] = weight;
+        if (count == 2) break;
+    }
+    if (count == 1) return nums[0];
+    if (count == 2) {
+        const int lo = std::min(nums[0], nums[1]);
+        const int hi = std::max(nums[0], nums[1]);
+        return std::max(lo, std::min(400, hi));
     }
     return 400;
 }
@@ -387,7 +402,8 @@ void WebFontManager::parse_import_rule(const std::shared_ptr<litehtml::raw_rule>
         return;
     }
 
-    FetchResult fr = loader_.load_resolved(resolved);
+    // Cache: litehtml's import_css will fetch this same @import during parsing.
+    FetchResult fr = loader_.load_resolved(resolved, /*use_cache=*/true);
     if (!fr.ok || fr.data.empty()) return;
 
     const std::string css(reinterpret_cast<const char*>(fr.data.data()), fr.data.size());
@@ -492,12 +508,14 @@ bool WebFontManager::install_font_file(const FontFace& face, const std::string& 
 }
 
 bool WebFontManager::activate_fontconfig_backend() {
-    // Deliberately process-global: on platforms whose default Pango font map is
-    // not Fontconfig-backed (e.g. the CoreText map on macOS) app-registered web
-    // fonts cannot be aliased, so swap the process default to an FT/Fontconfig
-    // map. Only reached when a document actually declares @font-face; from then
-    // on all text in this single-shot render goes through the same backend, so
-    // system and web fonts stay mutually consistent.
+    // On platforms whose default Pango font map is not Fontconfig-backed (e.g.
+    // the CoreText map on macOS) app-registered web fonts cannot be injected, so
+    // swap the process default to an FT/Fontconfig map. Only reached when a
+    // document actually declares @font-face; from then on all text in the render
+    // goes through the same backend, so system and web fonts stay mutually
+    // consistent. The swap is process-global but scoped: cleanup() restores the
+    // displaced map (see prev_default_map_), so the mutation does not leak past
+    // this manager's lifetime.
     PangoFontMap* current = pango_cairo_font_map_get_default();
     if (current && PANGO_IS_FC_FONT_MAP(current) && FcConfigGetCurrent()) {
         fontconfig_available_ = true;
@@ -509,6 +527,11 @@ bool WebFontManager::activate_fontconfig_backend() {
 
     const bool is_fc = PANGO_IS_FC_FONT_MAP(ft_map);
     if (is_fc) {
+        // Remember the map we displace so cleanup() can restore it, keeping the
+        // process-global default swap scoped to this manager's lifetime. Take an
+        // owned ref: set_default() unrefs the previous default as it installs the
+        // new one, so without this ref the original map would be destroyed.
+        if (!prev_default_map_ && current) prev_default_map_ = g_object_ref(current);
         pango_cairo_font_map_set_default(PANGO_CAIRO_FONT_MAP(ft_map));
     }
     g_object_unref(ft_map);
@@ -605,6 +628,16 @@ void WebFontManager::cleanup() {
     }
     installed_any_font_ = false;
 
+    // Revert the process-global default font map swap (if any), restoring the
+    // exact map displaced in activate_fontconfig_backend(). Done after the app
+    // fonts are cleared/flushed above, while the swapped map is still default.
+    if (prev_default_map_) {
+        pango_cairo_font_map_set_default(
+            PANGO_CAIRO_FONT_MAP(static_cast<PangoFontMap*>(prev_default_map_)));
+        g_object_unref(prev_default_map_);
+        prev_default_map_ = nullptr;
+    }
+
     if (!temp_dir_.empty()) {
         std::error_code ec;
         std::filesystem::remove_all(temp_dir_, ec);
@@ -626,6 +659,11 @@ std::string WebFontManager::ensure_temp_dir() {
         std::filesystem::path dir =
             base / ("html2pdf-fonts-" + std::to_string(now) + "-" + std::to_string(attempt));
         if (std::filesystem::create_directory(dir, ec)) {
+            // Restrict to the owner (0700): the directory holds decoded font
+            // bytes that other local users have no business reading.
+            std::error_code perm_ec;
+            std::filesystem::permissions(dir, std::filesystem::perms::owner_all,
+                                         std::filesystem::perm_options::replace, perm_ec);
             temp_dir_ = dir.string();
             return temp_dir_;
         }

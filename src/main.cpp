@@ -39,7 +39,14 @@ int main(int argc, char** argv) {
     using namespace html2pdf;
 
 #ifdef HTML2PDF_USE_PANGO
-    FcInit();
+    // Initialise Fontconfig for the whole run and tear it down on exit. RAII so
+    // every early return is covered; declared first, so it is destroyed last —
+    // after the container and its WebFontManager have cleared their
+    // app-registered fonts.
+    struct FcGuard {
+        FcGuard() { FcInit(); }
+        ~FcGuard() { FcFini(); }
+    } fc_guard;
 #endif
 
     ParseResult parsed = parse_args(argc, argv);

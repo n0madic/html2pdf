@@ -99,7 +99,10 @@ double find_break(const ri_ptr& item, double origin_y, double page_top, double c
     double best = -1.0;
     for (const ri_ptr& child : item->children()) {
         const double child_top = child_origin_y + static_cast<double>(child->top());
-        if (child_top >= page_bottom) break;  // this child and the rest start below the page
+        // Children are not guaranteed to be in ascending vertical order (floats
+        // and other out-of-flow boxes can appear anywhere in the list), so skip
+        // — not break on — a child that starts below the page and keep scanning.
+        if (child_top >= page_bottom) continue;
         const double cb = find_break(child, child_origin_y, page_top, capacity);
         if (cb > page_top + kEps && cb <= page_bottom + kEps && cb > best) best = cb;
     }
@@ -118,8 +121,17 @@ std::vector<double> compute_page_breaks(const litehtml::document::ptr& doc,
     const ri_ptr root = doc->root_render();
     if (root && content_h > 0.0 && capacity > 0.0) {
         constexpr double kEps = 1e-6;
+        // Safety cap: pathological input (an enormous content height, or a tiny
+        // printable area) could otherwise emit a runaway number of pages. Stop
+        // paginating past this many pages; any remaining content is omitted.
+        constexpr std::size_t kMaxPages = 10000;
         double cur = 0.0;
         while (cur < content_h - kEps) {
+            if (breaks.size() > kMaxPages) {
+                std::cerr << "warning: page count capped at " << kMaxPages
+                          << "; remaining content omitted\n";
+                break;
+            }
             double b = find_break(root, 0.0, cur, capacity);
             if (b <= cur + kEps) b = cur + capacity;  // nothing divisible fits: hard cut
             if (b > content_h) b = content_h;

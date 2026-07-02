@@ -86,10 +86,13 @@ bool resolve_page_size(const std::string& spec, bool landscape, double& w_pt, do
         // Custom "WxH[unit]" form. Split on the first 'x'.
         const auto xpos = lower.find('x');
         if (xpos == std::string::npos || xpos == 0 || xpos + 1 >= lower.size()) return false;
-        const std::string w_str = lower.substr(0, xpos);
+        std::string w_str = lower.substr(0, xpos);
         std::string h_str = lower.substr(xpos + 1);
 
-        // Trailing unit on the height part: mm|cm|in|pt (default mm).
+        // Optional trailing unit (mm|cm|in|pt, default mm) applies to both
+        // dimensions. It may be written once at the end (WxH<unit>) or on both
+        // parts (W<unit>xH<unit>); the unit is taken from the height and, when
+        // present, also stripped from the width. All unit strings are 2 chars.
         double factor = 72.0 / 25.4;  // mm -> pt
         const std::pair<const char*, double> units[] = {
             {"mm", 72.0 / 25.4}, {"cm", 72.0 / 2.54}, {"in", 72.0}, {"pt", 1.0},
@@ -98,6 +101,7 @@ bool resolve_page_size(const std::string& spec, bool landscape, double& w_pt, do
             if (ends_with(h_str, u.first)) {
                 factor = u.second;
                 h_str.erase(h_str.size() - 2);
+                if (ends_with(w_str, u.first)) w_str.erase(w_str.size() - 2);
                 break;
             }
         }
