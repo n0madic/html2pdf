@@ -1,8 +1,15 @@
 #include "html_container.h"
 
+#include <array>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+
+#include <litehtml/html.h>
+
+#ifdef HTML2PDF_USE_PANGO
+#include "web_font_manager.h"
+#endif
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_HDR
@@ -41,6 +48,30 @@ std::string first_family(const std::string& list) {
 }
 #endif  // !HTML2PDF_USE_PANGO
 
+#ifdef HTML2PDF_USE_PANGO
+std::string pango_family_list(const std::string& css_families,
+                              const WebFontManager& web_fonts) {
+    litehtml::string_vector tokens;
+    litehtml::split_string(css_families, tokens, ",", "", "\"'");
+
+    std::string out;
+    for (auto font : tokens) {
+        litehtml::trim(font, " \t\r\n\f\v\"'");
+        if (font.empty()) continue;
+
+        std::string lower = font;
+        litehtml::lcase(lower);
+        if (!litehtml::value_in_list(lower, "serif;sans-serif;monospace;cursive;fantasy;")) {
+            font = web_fonts.resolve_family_for_pango(font);
+        }
+        out += font;
+        out += ",";
+    }
+
+    return out.empty() ? std::string("serif,") : out;
+}
+#endif  // HTML2PDF_USE_PANGO
+
 // Premultiply one 8-bit channel by alpha with rounding.
 inline uint8_t premul(uint8_t c, uint8_t a) {
     return static_cast<uint8_t>((static_cast<int>(c) * a + 127) / 255);
@@ -50,7 +81,11 @@ inline uint8_t premul(uint8_t c, uint8_t a) {
 
 HtmlContainer::HtmlContainer(int width, int height, ResourceLoader& loader)
     : width_(width), height_(height), loader_(loader) {
-#ifndef HTML2PDF_USE_PANGO
+#ifdef HTML2PDF_USE_PANGO
+    pango_scratch_surface_ = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 2, 2);
+    pango_scratch_cr_ = cairo_create(pango_scratch_surface_);
+    web_fonts_ = std::make_unique<WebFontManager>(loader_);
+#else
     scratch_surface_ = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
     scratch_cr_ = cairo_create(scratch_surface_);
 #endif
@@ -60,13 +95,130 @@ HtmlContainer::~HtmlContainer() {
     for (auto& kv : image_cache_) {
         if (kv.second) cairo_surface_destroy(kv.second);
     }
-#ifndef HTML2PDF_USE_PANGO
+#ifdef HTML2PDF_USE_PANGO
+    if (pango_scratch_cr_) cairo_destroy(pango_scratch_cr_);
+    if (pango_scratch_surface_) cairo_surface_destroy(pango_scratch_surface_);
+#else
     if (scratch_cr_) cairo_destroy(scratch_cr_);
     if (scratch_surface_) cairo_surface_destroy(scratch_surface_);
 #endif
 }
 
-#ifndef HTML2PDF_USE_PANGO
+#ifdef HTML2PDF_USE_PANGO
+
+void HtmlContainer::load_web_fonts_from_html(const std::string& html) {
+    if (web_fonts_) web_fonts_->load_from_html(html);
+}
+
+litehtml::uint_ptr HtmlContainer::create_font(const litehtml::font_description& descr,
+                                              const litehtml::document* doc,
+                                              litehtml::font_metrics* fm) {
+    const std::string families = web_fonts_ ? pango_family_list(descr.family, *web_fonts_)
+                                            : std::string("serif,");
+
+    PangoFontDescription* desc = pango_font_description_new();
+    pango_font_description_set_family(desc, families.c_str());
+    pango_font_description_set_absolute_size(desc, descr.size * PANGO_SCALE);
+    pango_font_description_set_style(desc,
+                                     descr.style == litehtml::font_style_italic
+                                         ? PANGO_STYLE_ITALIC
+                                         : PANGO_STYLE_NORMAL);
+    pango_font_description_set_weight(desc, static_cast<PangoWeight>(descr.weight));
+
+    cairo_font* ret = nullptr;
+
+    if (fm) {
+        fm->font_size = descr.size;
+
+        cairo_save(pango_scratch_cr_);
+        PangoLayout* layout = pango_cairo_create_layout(pango_scratch_cr_);
+        PangoContext* context = pango_layout_get_context(layout);
+        PangoLanguage* language = pango_language_get_default();
+        pango_layout_set_font_description(layout, desc);
+        PangoFontMetrics* metrics = pango_context_get_metrics(context, desc, language);
+
+        fm->ascent = PANGO_PIXELS(static_cast<double>(pango_font_metrics_get_ascent(metrics)));
+        fm->height = PANGO_PIXELS(static_cast<double>(pango_font_metrics_get_height(metrics)));
+        fm->descent = fm->height - fm->ascent;
+        fm->x_height = fm->height;
+        fm->draw_spaces = (descr.decoration_line != litehtml::text_decoration_line_none);
+        fm->sub_shift = descr.size / 5;
+        fm->super_shift = descr.size / 3;
+
+        pango_layout_set_text(layout, "x", 1);
+
+        PangoRectangle ink_rect;
+        PangoRectangle logical_rect;
+        pango_layout_get_pixel_extents(layout, &ink_rect, &logical_rect);
+        fm->x_height = ink_rect.height;
+        if (fm->x_height == fm->height) fm->x_height = fm->x_height * 4 / 5;
+
+        pango_layout_set_text(layout, "0", 1);
+
+        pango_layout_get_pixel_extents(layout, &ink_rect, &logical_rect);
+        fm->ch_width = logical_rect.width;
+
+        cairo_restore(pango_scratch_cr_);
+
+        ret = new cairo_font;
+        ret->font = desc;
+        ret->size = descr.size;
+        ret->strikeout = (descr.decoration_line & litehtml::text_decoration_line_line_through) != 0;
+        ret->underline = (descr.decoration_line & litehtml::text_decoration_line_underline) != 0;
+        ret->overline = (descr.decoration_line & litehtml::text_decoration_line_overline) != 0;
+        ret->ascent = fm->ascent;
+        ret->descent = fm->descent;
+        ret->decoration_color = descr.decoration_color;
+        ret->decoration_style = descr.decoration_style;
+
+        auto thickness = descr.decoration_thickness;
+        if (!thickness.is_predefined() && doc) {
+            litehtml::css_length one_em(1.0, litehtml::css_units_em);
+            doc->cvt_units(one_em, *fm, 0);
+            doc->cvt_units(thickness, *fm, static_cast<int>(one_em.val()));
+        }
+
+        ret->underline_position = -pango_font_metrics_get_underline_position(metrics);
+        if (thickness.is_predefined()) {
+            ret->underline_thickness = pango_font_metrics_get_underline_thickness(metrics);
+        } else {
+            ret->underline_thickness = static_cast<int>(thickness.val() * PANGO_SCALE);
+        }
+        pango_quantize_line_geometry(&ret->underline_thickness, &ret->underline_position);
+        ret->underline_thickness = PANGO_PIXELS(ret->underline_thickness);
+        ret->underline_position = PANGO_PIXELS(ret->underline_position);
+
+        ret->strikethrough_position = pango_font_metrics_get_strikethrough_position(metrics);
+        if (thickness.is_predefined()) {
+            ret->strikethrough_thickness = pango_font_metrics_get_strikethrough_thickness(metrics);
+        } else {
+            ret->strikethrough_thickness = static_cast<int>(thickness.val() * PANGO_SCALE);
+        }
+        pango_quantize_line_geometry(&ret->strikethrough_thickness,
+                                     &ret->strikethrough_position);
+        ret->strikethrough_thickness = PANGO_PIXELS(ret->strikethrough_thickness);
+        ret->strikethrough_position = PANGO_PIXELS(ret->strikethrough_position);
+
+        ret->overline_position = pango_units_from_double(fm->ascent);
+        if (thickness.is_predefined()) {
+            ret->overline_thickness = pango_font_metrics_get_underline_thickness(metrics);
+        } else {
+            ret->overline_thickness = static_cast<int>(thickness.val() * PANGO_SCALE);
+        }
+        pango_quantize_line_geometry(&ret->overline_thickness, &ret->overline_position);
+        ret->overline_thickness = PANGO_PIXELS(ret->overline_thickness);
+        ret->overline_position = PANGO_PIXELS(ret->overline_position);
+
+        g_object_unref(layout);
+        pango_font_metrics_unref(metrics);
+    } else {
+        pango_font_description_free(desc);
+    }
+
+    return reinterpret_cast<litehtml::uint_ptr>(ret);
+}
+
+#else
 
 void HtmlContainer::apply_font(cairo_t* cr, litehtml::uint_ptr hFont) {
     auto* f = reinterpret_cast<ToyFont*>(hFont);
@@ -246,6 +398,9 @@ void HtmlContainer::import_css(litehtml::string& text, const litehtml::string& u
     FetchResult fr = loader_.load_resolved(resolved);
     if (fr.ok && !fr.data.empty()) {
         text.assign(reinterpret_cast<const char*>(fr.data.data()), fr.data.size());
+#ifdef HTML2PDF_USE_PANGO
+        if (web_fonts_) web_fonts_->load_from_css(text, resolved);
+#endif
     }
     // Report the resolved location back so the sheet's own relative references
     // (nested @import, background images) resolve against it. On load failure

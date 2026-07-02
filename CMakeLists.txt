@@ -89,12 +89,14 @@ function(h2pdf_mixed_links in_ldflags out_var)
         elseif(tok MATCHES "^-l(.+)$")
             set(_name "${CMAKE_MATCH_1}")
             set(_a "")
-            foreach(d IN LISTS _dirs)
-                if(EXISTS "${d}/lib${_name}.a")
-                    set(_a "${d}/lib${_name}.a")
-                    break()
-                endif()
-            endforeach()
+            if(NOT _name IN_LIST H2PDF_MIXED_FORCE_DYNAMIC_LIBS)
+                foreach(d IN LISTS _dirs)
+                    if(EXISTS "${d}/lib${_name}.a")
+                        set(_a "${d}/lib${_name}.a")
+                        break()
+                    endif()
+                endforeach()
+            endif()
             if(_a)
                 if(NOT "${_a}" IN_LIST _seen)
                     list(APPEND _out "${_a}")
@@ -123,10 +125,39 @@ if(NOT HTML2PDF_TEXT_BACKEND STREQUAL "toy")
     pkg_check_modules(PANGOCAIRO IMPORTED_TARGET pangocairo)
     if(PANGOCAIRO_FOUND)
         set(HTML2PDF_USE_PANGO ON)
+        pkg_check_modules(FONTCONFIG REQUIRED IMPORTED_TARGET fontconfig)
+        # zlib: WOFF1 web fonts store each SFNT table DEFLATE-compressed.
+        pkg_check_modules(ZLIB REQUIRED IMPORTED_TARGET zlib)
     elseif(HTML2PDF_TEXT_BACKEND STREQUAL "pango")
         message(FATAL_ERROR
             "HTML2PDF_TEXT_BACKEND=pango but 'pangocairo' was not found via pkg-config")
     endif()
+endif()
+
+if(HTML2PDF_USE_PANGO)
+    FetchContent_Declare(woff2
+        GIT_REPOSITORY https://github.com/google/woff2.git
+        GIT_TAG        1bccf208bca986e53a647dfe4811322adb06ecf8) # v1.0.2
+    if(HTML2PDF_DEP_LINKAGE STREQUAL "static")
+        find_library(H2PDF_BROTLIDEC_STATIC NAMES libbrotlidec.a REQUIRED)
+        find_library(H2PDF_BROTLIENC_STATIC NAMES libbrotlienc.a REQUIRED)
+        find_library(H2PDF_BROTLICOMMON_STATIC NAMES libbrotlicommon.a REQUIRED)
+        set(BROTLIDEC_LIBRARIES
+            "${H2PDF_BROTLIDEC_STATIC};${H2PDF_BROTLICOMMON_STATIC}"
+            CACHE STRING "Static Brotli decoder libraries for google/woff2" FORCE)
+        set(BROTLIENC_LIBRARIES
+            "${H2PDF_BROTLIENC_STATIC};${H2PDF_BROTLICOMMON_STATIC}"
+            CACHE STRING "Static Brotli encoder libraries for google/woff2" FORCE)
+    endif()
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+    FetchContent_MakeAvailable(woff2)
+    foreach(extra_woff2_target
+            woff2enc woff2_decompress woff2_compress woff2_info
+            convert_woff2ttf_fuzzer convert_woff2ttf_fuzzer_new_entry)
+        if(TARGET ${extra_woff2_target})
+            set_target_properties(${extra_woff2_target} PROPERTIES EXCLUDE_FROM_ALL TRUE)
+        endif()
+    endforeach()
 endif()
 
 # Reference cairo container shipped inside the litehtml source tree.
@@ -144,6 +175,7 @@ add_executable(html2pdf
     src/main.cpp
     src/cli.cpp
     src/resource_loader.cpp
+    src/web_font_manager.cpp
     src/html_container.cpp
     src/renderer.cpp
     ${CONTAINER_SOURCES})
@@ -157,13 +189,16 @@ target_link_libraries(html2pdf PRIVATE litehtml)
 
 if(HTML2PDF_USE_PANGO)
     target_compile_definitions(html2pdf PRIVATE HTML2PDF_USE_PANGO)
+    target_include_directories(html2pdf PRIVATE ${woff2_SOURCE_DIR}/include)
+    target_link_libraries(html2pdf PRIVATE woff2dec)
 endif()
 
 if(HTML2PDF_DEP_LINKAGE STREQUAL "shared")
     # All external dependencies dynamic.
     target_link_libraries(html2pdf PRIVATE PkgConfig::CAIRO PkgConfig::CURL)
     if(HTML2PDF_USE_PANGO)
-        target_link_libraries(html2pdf PRIVATE PkgConfig::PANGOCAIRO)
+        target_link_libraries(html2pdf PRIVATE
+            PkgConfig::PANGOCAIRO PkgConfig::FONTCONFIG PkgConfig::ZLIB)
     endif()
 
 elseif(HTML2PDF_DEP_LINKAGE STREQUAL "static")
@@ -175,9 +210,15 @@ elseif(HTML2PDF_DEP_LINKAGE STREQUAL "static")
         ${CAIRO_STATIC_LIBRARY_DIRS} ${CURL_STATIC_LIBRARY_DIRS})
     set(STATIC_DEP_LIBS ${CAIRO_STATIC_LIBRARIES} ${CURL_STATIC_LIBRARIES})
     if(HTML2PDF_USE_PANGO)
-        target_include_directories(html2pdf PRIVATE ${PANGOCAIRO_STATIC_INCLUDE_DIRS})
-        target_link_directories(html2pdf PRIVATE ${PANGOCAIRO_STATIC_LIBRARY_DIRS})
-        list(APPEND STATIC_DEP_LIBS ${PANGOCAIRO_STATIC_LIBRARIES})
+        target_include_directories(html2pdf PRIVATE
+            ${PANGOCAIRO_STATIC_INCLUDE_DIRS} ${FONTCONFIG_STATIC_INCLUDE_DIRS}
+            ${ZLIB_STATIC_INCLUDE_DIRS})
+        target_link_directories(html2pdf PRIVATE
+            ${PANGOCAIRO_STATIC_LIBRARY_DIRS} ${FONTCONFIG_STATIC_LIBRARY_DIRS}
+            ${ZLIB_STATIC_LIBRARY_DIRS})
+        list(APPEND STATIC_DEP_LIBS
+            ${PANGOCAIRO_STATIC_LIBRARIES} ${FONTCONFIG_STATIC_LIBRARIES}
+            ${ZLIB_STATIC_LIBRARIES})
     endif()
     list(REMOVE_DUPLICATES STATIC_DEP_LIBS)
     target_link_options(html2pdf PRIVATE -static)
@@ -189,8 +230,15 @@ else()  # mixed (default): static where a .a exists, dynamic otherwise
         ${CAIRO_INCLUDE_DIRS} ${CURL_INCLUDE_DIRS})
     set(MIXED_LDFLAGS ${CAIRO_STATIC_LDFLAGS} ${CURL_STATIC_LDFLAGS})
     if(HTML2PDF_USE_PANGO)
-        target_include_directories(html2pdf PRIVATE ${PANGOCAIRO_INCLUDE_DIRS})
-        list(APPEND MIXED_LDFLAGS ${PANGOCAIRO_STATIC_LDFLAGS})
+        # Fontconfig has process-global initialization/config state. In mixed
+        # builds, dynamic Cairo/Pango can also load libfontconfig.dylib/so; do
+        # not embed a second static copy or FcInit() and app fonts affect the
+        # wrong instance.
+        list(APPEND H2PDF_MIXED_FORCE_DYNAMIC_LIBS fontconfig)
+        target_include_directories(html2pdf PRIVATE
+            ${PANGOCAIRO_INCLUDE_DIRS} ${FONTCONFIG_INCLUDE_DIRS} ${ZLIB_INCLUDE_DIRS})
+        list(APPEND MIXED_LDFLAGS
+            ${PANGOCAIRO_STATIC_LDFLAGS} ${FONTCONFIG_STATIC_LDFLAGS} ${ZLIB_STATIC_LDFLAGS})
     endif()
     h2pdf_mixed_links("${MIXED_LDFLAGS}" MIXED_LINKS)
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")

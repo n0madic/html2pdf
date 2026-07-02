@@ -26,6 +26,9 @@ ARG TEXT_BACKEND=pango
 ARG PANGO_VER=1.54.0
 
 # Toolchain + headers + static archives for the full dependency closure.
+# brotli-dev/brotli-static are needed by google/woff2 for Pango web-font WOFF2
+# decoding; toy builds still install them because this image keeps one package
+# closure for both backend variants.
 RUN apk add --no-cache \
         build-base cmake samurai git pkgconf meson ninja-build xz wget \
         cairo-dev pixman-dev curl-dev \

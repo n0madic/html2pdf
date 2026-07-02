@@ -2,6 +2,7 @@
 
 #include <cairo.h>
 
+#include <memory>
 #include <string>
 #include <unordered_map>
 
@@ -15,6 +16,10 @@
 #include "resource_loader.h"
 
 namespace html2pdf {
+
+#ifdef HTML2PDF_USE_PANGO
+class WebFontManager;
+#endif
 
 // Base container selected at build time. With the Pango backend the font hooks
 // (create_font / draw_text / text_width) come from container_cairo_pango;
@@ -38,7 +43,12 @@ public:
     HtmlContainer(const HtmlContainer&) = delete;
     HtmlContainer& operator=(const HtmlContainer&) = delete;
 
-#ifndef HTML2PDF_USE_PANGO
+#ifdef HTML2PDF_USE_PANGO
+    void load_web_fonts_from_html(const std::string& html);
+    litehtml::uint_ptr create_font(const litehtml::font_description& descr,
+                                   const litehtml::document* doc,
+                                   litehtml::font_metrics* fm) override;
+#else
     // --- Fonts (Cairo toy text API; Pango backend supplies its own) ---
     litehtml::uint_ptr create_font(const litehtml::font_description& descr,
                                    const litehtml::document* doc,
@@ -84,7 +94,11 @@ private:
     int height_;
     ResourceLoader& loader_;
 
-#ifndef HTML2PDF_USE_PANGO
+#ifdef HTML2PDF_USE_PANGO
+    std::unique_ptr<WebFontManager> web_fonts_;
+    cairo_surface_t* pango_scratch_surface_ = nullptr;
+    cairo_t* pango_scratch_cr_ = nullptr;
+#else
     // Scratch context for off-draw measurements (1x1 ARGB32 surface).
     cairo_surface_t* scratch_surface_ = nullptr;
     cairo_t* scratch_cr_ = nullptr;

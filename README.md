@@ -22,6 +22,9 @@ file extension. No Qt, GTK, headless browser or other heavy runtime is required.
   [`stb_image`](https://github.com/nothings/stb).
 - Inline `data:` URIs (RFC 2397, base64 or percent-encoded) for images and
   stylesheets, decoded in-process with no network or filesystem access.
+- CSS `@font-face` web fonts with the Pango backend: TTF/OTF are used directly
+  while WOFF2 and WOFF1 are decoded in-process. The Cairo toy backend
+  intentionally ignores web fonts and keeps its existing fallback behavior.
 - Automatic content height (`--height` omitted) or a fixed canvas size; output
   dimensions are clamped to Cairo's surface limit (32767 px per side).
 - Graceful degradation: unreachable stylesheets/images never abort the render.
@@ -100,6 +103,10 @@ All diagnostic messages are written to `stderr`.
 | Cairo | system / Homebrew, via `pkg-config` | mixed* |
 | libcurl | system / Homebrew, via `pkg-config` | mixed* |
 | Pango (`pangocairo`) — **optional** | system / Homebrew, via `pkg-config` | mixed* |
+| Fontconfig — **Pango web fonts** | system / Homebrew, via `pkg-config` | mixed* |
+| google/woff2 — **Pango web fonts** | CMake `FetchContent` (needs network on first Pango configure) | static |
+| Brotli — **WOFF2 decode** | system / Homebrew, found by google/woff2 | mixed* |
+| zlib — **WOFF1 decode** | system / Homebrew, via `pkg-config` | mixed* |
 
 \* These and their transitive dependencies (freetype, libpng, fontconfig, glib,
 harfbuzz, …) are linked according to `HTML2PDF_DEP_LINKAGE` — by default
@@ -108,14 +115,16 @@ harfbuzz, …) are linked according to `HTML2PDF_DEP_LINKAGE` — by default
 modes.
 
 Requirements: a C++17 compiler, CMake ≥ 3.16, `pkg-config`, and the Cairo and
-libcurl development packages.
+libcurl development packages. Pango builds with web-font support also need
+Fontconfig, Brotli (WOFF2) and zlib (WOFF1) development packages.
 
 ```bash
 # macOS (Homebrew)
-brew install cmake pkg-config cairo curl
+brew install cmake pkg-config cairo curl pango fontconfig brotli zlib
 
 # Debian/Ubuntu
-sudo apt install build-essential cmake pkg-config libcairo2-dev libcurl4-openssl-dev
+sudo apt install build-essential cmake pkg-config libcairo2-dev libcurl4-openssl-dev \
+    libpango1.0-dev libfontconfig-dev libbrotli-dev zlib1g-dev
 ```
 
 ## Build
@@ -123,6 +132,7 @@ sudo apt install build-essential cmake pkg-config libcairo2-dev libcurl4-openssl
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j     # first configure clones litehtml v0.10
+                           # and, for Pango builds, google/woff2 v1.0.2
 ```
 
 The executable is written to `build/html2pdf`.
@@ -163,13 +173,21 @@ also shown at the bottom of `--help`.
   (underline / line-through / overline only).
 - **Pango** (`container_cairo_pango` from the litehtml tree) — proper shaping,
   bidirectional text, automatic font fallback and the full set of CSS
-  `text-decoration` styles (solid / double / dotted / dashed / wavy). Requires
-  the `pangocairo` development package:
+  `text-decoration` styles (solid / double / dotted / dashed / wavy). It also
+  supports CSS `@font-face` from inline stylesheets, external stylesheets,
+  nested `@import`, nested `@media`, regular resource URLs and `data:` URIs.
+  TTF/OTF are registered directly; WOFF2 is decoded through the statically
+  linked google/woff2 decoder and WOFF1 through zlib. Requires the `pangocairo`,
+  Fontconfig, Brotli and zlib development packages:
 
   ```bash
-  brew install pango                 # macOS (Homebrew)
-  sudo apt install libpango1.0-dev   # Debian/Ubuntu
+  brew install pango fontconfig brotli zlib
+  sudo apt install libpango1.0-dev libfontconfig-dev libbrotli-dev zlib1g-dev
   ```
+
+  `@font-face` family aliases are honored: the CSS `font-family` name does not
+  need to match the font file's internal family. The toy backend does not load
+  web fonts.
 
 ## Dependency linkage
 

@@ -112,6 +112,90 @@ expect_no_grep() {
     if grep -qE "$pat" "$file" 2>/dev/null; then bad "$desc (unexpected match: $pat)"; else ok "$desc"; fi
 }
 
+make_webfont_fixture() {
+    command -v python3 >/dev/null 2>&1 || return 1
+    local src="$FIX/webfont"
+    local dst="$OUT/webfont"
+    mkdir -p "$dst/css"
+    python3 - "$src" "$dst" <<'PY'
+import base64
+import struct
+import sys
+import zlib
+from pathlib import Path
+
+src = Path(sys.argv[1])
+dst = Path(sys.argv[2])
+
+def b64(name):
+    return ''.join((src / name).read_text().split())
+
+def ttf_to_woff1(ttf):
+    # Repackage a bare SFNT as a WOFF (v1) container: per-table zlib compression,
+    # kept only when it shrinks the table. Mirrors what woff1_to_sfnt decodes.
+    num_tables = struct.unpack('>H', ttf[4:6])[0]
+    entries = [struct.unpack('>4sIII', ttf[12 + i * 16:28 + i * 16]) for i in range(num_tables)]
+    sfnt_size = 12 + 16 * num_tables
+    for _, _, _, tlen in entries:
+        sfnt_size += (tlen + 3) & ~3
+    body = b''
+    directory = b''
+    offset = 44 + 20 * num_tables
+    for tag, checksum, toff, tlen in entries:
+        original = ttf[toff:toff + tlen]
+        compressed = zlib.compress(original, 9)
+        stored = compressed if len(compressed) < tlen else original
+        directory += struct.pack('>4sIIII', tag, offset, len(stored), tlen, checksum)
+        padded = stored + b'\x00' * ((-len(stored)) & 3)
+        body += padded
+        offset += len(padded)
+    total = 44 + 20 * num_tables + len(body)
+    header = struct.pack('>4sIIHHIHHIIIII', b'wOFF', struct.unpack('>I', ttf[0:4])[0],
+                         total, num_tables, 0, sfnt_size, 1, 0, 0, 0, 0, 0, 0)
+    return header + directory + body
+
+ttf_bytes = base64.b64decode(b64('fixture.ttf.b64'))
+(dst / 'fixture.ttf').write_bytes(ttf_bytes)
+(dst / 'fixture.woff1').write_bytes(ttf_to_woff1(ttf_bytes))
+woff2 = b64('fixture.woff2.b64')
+(dst / 'fixture.woff2').write_bytes(base64.b64decode(woff2))
+
+text = ' '.join(['A'] * 40)
+common = '.sample{font-family:"AliasWide",sans-serif;font-size:32px;line-height:1;width:320px}'
+
+def page(style):
+    return f'<!doctype html><html><head><meta charset="utf-8"><style>{style}</style></head><body><div class="sample">{text}</div></body></html>'
+
+(dst / 'fallback.html').write_text(page(common))
+(dst / 'inline_ttf.html').write_text(page(
+    '@font-face{font-family:"AliasWide";src:url("fixture.ttf") format("truetype");font-weight:400;font-style:normal}' + common
+))
+(dst / 'woff1.html').write_text(page(
+    '@font-face{font-family:"AliasWide";src:url("fixture.woff1") format("woff");font-weight:400;font-style:normal}' + common
+))
+(dst / 'data_woff2.html').write_text(page(
+    f'@font-face{{font-family:"AliasWide";src:url("data:font/woff2;base64,{woff2}") format("woff2");font-weight:400;font-style:normal}}' + common
+))
+(dst / 'malformed_woff2.html').write_text(page(
+    '@font-face{font-family:"AliasWide";src:url("data:font/woff2;base64,d09GMg==") format("woff2")}' + common
+))
+# "wOFF" magic only: passes the sniff but is too short to decode (bounds check).
+(dst / 'malformed_woff1.html').write_text(page(
+    '@font-face{font-family:"AliasWide";src:url("data:font/woff;base64,d09GRg==") format("woff")}' + common
+))
+(dst / 'blocked_font.html').write_text(page(
+    '@font-face{font-family:"AliasWide";src:url("http://127.0.0.1:1/nope.woff2") format("woff2")}' + common
+))
+(dst / 'import_woff2.html').write_text(
+    f'<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="css/import.css"></head><body><div class="sample">{text}</div></body></html>'
+)
+(dst / 'css' / 'import.css').write_text('@import url("nested.css");' + common)
+(dst / 'css' / 'nested.css').write_text(
+    '@media screen{@font-face{font-family:"AliasWide";src:url("../fixture.woff2") format("woff2");font-weight:400;font-style:normal}}'
+)
+PY
+}
+
 echo "html2pdf test suite"
 echo "binary: $BIN"
 echo
@@ -166,6 +250,68 @@ DBAD="$OUT/databad.html"
 printf '<!DOCTYPE html><html><body><img src="data:image/png;base64,@@@not-base64"></body></html>' > "$DBAD"
 "$BIN" --input "$DBAD" --output "$OUT/databad.png" >/dev/null 2>&1
 expect_code 0 $? "malformed data: URI -> still renders"
+
+# ----------------------------------------------------------------------------
+echo "[2i] Pango web fonts: TTF aliases, WOFF2 import/data URI, graceful failures"
+if make_webfont_fixture; then
+    WFIX="$OUT/webfont"
+    if "$BIN" --help 2>/dev/null | grep -q 'Text backend: Pango' && command -v file >/dev/null 2>&1; then
+        "$BIN" --input "$WFIX/fallback.html" --output "$WFIX/fallback.png" >/dev/null 2>&1
+        expect_code 0 $? "webfont fallback baseline -> png"
+        BASE_H="$(png_height "$WFIX/fallback.png")"
+
+        "$BIN" --input "$WFIX/inline_ttf.html" --output "$WFIX/inline_ttf.png" >/dev/null 2>&1
+        expect_code 0 $? "inline @font-face TTF alias -> png"
+        TTF_H="$(png_height "$WFIX/inline_ttf.png")"
+        if [[ -n "$BASE_H" && -n "$TTF_H" && "$TTF_H" -gt $((BASE_H + 150)) ]]; then
+            ok "CSS family alias uses loaded TTF (height $TTF_H > fallback $BASE_H)"
+        else
+            bad "CSS family alias did not affect TTF layout (height ${TTF_H:-?}, fallback ${BASE_H:-?})"
+        fi
+
+        "$BIN" --input "$WFIX/import_woff2.html" --output "$WFIX/import_woff2.png" >/dev/null 2>&1
+        expect_code 0 $? "external CSS + nested @import/@media WOFF2 -> png"
+        IMP_H="$(png_height "$WFIX/import_woff2.png")"
+        if [[ -n "$BASE_H" && -n "$IMP_H" && "$IMP_H" -gt $((BASE_H + 150)) ]]; then
+            ok "nested imported WOFF2 applied (height $IMP_H > fallback $BASE_H)"
+        else
+            bad "nested imported WOFF2 did not affect layout (height ${IMP_H:-?}, fallback ${BASE_H:-?})"
+        fi
+
+        "$BIN" --input "$WFIX/data_woff2.html" --output "$WFIX/data_woff2.png" >/dev/null 2>&1
+        expect_code 0 $? "data: URI WOFF2 -> png"
+        DATA_H="$(png_height "$WFIX/data_woff2.png")"
+        if [[ -n "$BASE_H" && -n "$DATA_H" && "$DATA_H" -gt $((BASE_H + 150)) ]]; then
+            ok "data: URI WOFF2 applied (height $DATA_H > fallback $BASE_H)"
+        else
+            bad "data: URI WOFF2 did not affect layout (height ${DATA_H:-?}, fallback ${BASE_H:-?})"
+        fi
+
+        "$BIN" --input "$WFIX/woff1.html" --output "$WFIX/woff1.png" >/dev/null 2>&1
+        expect_code 0 $? "inline @font-face WOFF1 -> png"
+        W1_H="$(png_height "$WFIX/woff1.png")"
+        if [[ -n "$BASE_H" && -n "$W1_H" && "$W1_H" -gt $((BASE_H + 150)) ]]; then
+            ok "WOFF1 decoded (zlib) and applied (height $W1_H > fallback $BASE_H)"
+        else
+            bad "WOFF1 did not affect layout (height ${W1_H:-?}, fallback ${BASE_H:-?})"
+        fi
+
+        "$BIN" --input "$WFIX/malformed_woff2.html" --output "$WFIX/malformed_woff2.png" >/dev/null 2>&1
+        expect_code 0 $? "malformed WOFF2 font -> still renders"
+
+        "$BIN" --input "$WFIX/malformed_woff1.html" --output "$WFIX/malformed_woff1.png" >/dev/null 2>&1
+        expect_code 0 $? "malformed WOFF1 font -> still renders"
+
+        "$BIN" --input "$WFIX/blocked_font.html" --output "$WFIX/blocked_font.png" >/dev/null 2>&1
+        expect_code 0 $? "blocked/unreachable font URL -> still renders"
+    else
+        "$BIN" --input "$WFIX/inline_ttf.html" --output "$WFIX/toy_webfont_ignored.png" >/dev/null 2>&1
+        expect_code 0 $? "webfont CSS ignored gracefully by non-Pango backend"
+        expect_magic "$WFIX/toy_webfont_ignored.png" $'\x89PNG' "toy webfont smoke PNG magic"
+    fi
+else
+    echo "  SKIP: python3 not available"
+fi
 
 # ----------------------------------------------------------------------------
 echo "[2c] HTTP fetch, URL resolution and SSRF guard (optional, needs python3)"

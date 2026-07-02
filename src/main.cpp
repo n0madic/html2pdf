@@ -10,6 +10,10 @@
 #include "renderer.h"
 #include "resource_loader.h"
 
+#ifdef HTML2PDF_USE_PANGO
+#include <fontconfig/fontconfig.h>
+#endif
+
 namespace {
 // Provisional viewport height used for media queries / vh units when the
 // output height is auto. The actual output height comes from the laid-out
@@ -33,6 +37,10 @@ int clamp_dim(double v) {
 
 int main(int argc, char** argv) {
     using namespace html2pdf;
+
+#ifdef HTML2PDF_USE_PANGO
+    FcInit();
+#endif
 
     ParseResult parsed = parse_args(argc, argv);
     switch (parsed.status) {
@@ -68,6 +76,9 @@ int main(int argc, char** argv) {
             ? std::string()
             : std::string(reinterpret_cast<const char*>(main_doc.data.data()),
                           main_doc.data.size());
+#ifdef HTML2PDF_USE_PANGO
+    container.load_web_fonts_from_html(html);
+#endif
     litehtml::document::ptr doc = litehtml::document::createFromString(html, &container);
     if (!doc) {
         std::cerr << "error: failed to parse HTML document\n";
