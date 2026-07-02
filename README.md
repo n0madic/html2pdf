@@ -100,6 +100,7 @@ All diagnostic messages are written to `stderr`.
 | litehtml (+ bundled gumbo) | CMake `FetchContent` (needs network on first configure) | static |
 | reference `container_cairo` | compiled from the litehtml source tree | static |
 | `stb_image.h` | vendored in `third_party/` | header-only |
+| `base64.hpp` ([tobiaslocker/base64](https://github.com/tobiaslocker/base64)) | vendored in `third_party/` | header-only |
 | Cairo | system / Homebrew, via `pkg-config` | mixed* |
 | libcurl | system / Homebrew, via `pkg-config` | mixed* |
 | Pango (`pangocairo`) — **optional** | system / Homebrew, via `pkg-config` | mixed* |

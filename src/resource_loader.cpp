@@ -1,5 +1,7 @@
 #include "resource_loader.h"
 
+#include "base64.hpp"
+
 #include <curl/curl.h>
 
 #include <arpa/inet.h>
@@ -64,33 +66,28 @@ bool is_data_uri(const std::string& s) {
 // Decode RFC 4648 base64 from `in` into `out`, tolerating embedded ASCII
 // whitespace and omitted '=' padding. Returns false on an invalid character,
 // data after padding, or an impossible 4n+1 length.
+//
+// The actual decode is delegated to base64::decode_into (third_party/base64.hpp),
+// which is strict: it rejects whitespace and requires a length that is a multiple
+// of 4. We first normalise the input to satisfy those preconditions while keeping
+// the lenient contract browsers expect from data: URIs.
 bool base64_decode(const std::string& in, std::vector<unsigned char>& out) {
-    auto sextet = [](unsigned char c) -> int {
-        if (c >= 'A' && c <= 'Z') return c - 'A';
-        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-        if (c >= '0' && c <= '9') return c - '0' + 52;
-        if (c == '+') return 62;
-        if (c == '/') return 63;
-        return -1;
-    };
-    uint32_t acc = 0;
-    int bits = 0;
-    bool padded = false;
+    std::string cleaned;
+    cleaned.reserve(in.size());
     for (unsigned char c : in) {
         if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' || c == '\v') continue;
-        if (c == '=') { padded = true; continue; }
-        if (padded) return false;  // data after padding
-        const int v = sextet(c);
-        if (v < 0) return false;
-        acc = (acc << 6) | static_cast<uint32_t>(v);
-        bits += 6;
-        if (bits >= 8) {
-            bits -= 8;
-            out.push_back(static_cast<unsigned char>((acc >> bits) & 0xFFu));
-        }
+        cleaned.push_back(static_cast<char>(c));
     }
-    // A lone trailing sextet leaves 6 unconsumed bits and cannot form a byte.
-    return bits != 6;
+    // A 4n+1 length is impossible for valid base64.
+    if ((cleaned.size() & 3u) == 1u) return false;
+    // Restore any omitted '=' padding so the length is a multiple of 4.
+    while ((cleaned.size() & 3u) != 0u) cleaned.push_back('=');
+    try {
+        out = base64::decode_into<std::vector<unsigned char>>(cleaned);
+    } catch (const std::exception&) {
+        return false;
+    }
+    return true;
 }
 
 // Decode percent-encoding (%XX) from `in` into `out`. A stray or truncated '%'
